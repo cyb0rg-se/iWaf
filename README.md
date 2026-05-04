@@ -1,4 +1,4 @@
-# PhoenixWAF
+# iWAF
 
 ![Language](https://img.shields.io/badge/language-PHP%205.x%2B-blue.svg)
 ![Feature](https://img.shields.io/badge/feature-LD__PRELOAD%20%7C%20inotifywait-green.svg)
@@ -7,7 +7,7 @@
 
 ## 项目简介
 
-PhoenixWAF 是一款专为 AWD (Attack With Defense) CTF 竞赛设计的、极具防御纵深的高阶 PHP Web 应用防火墙。通过流量解码、内核监控、底层系统调用劫持等多维度防御手段，系统不仅能有效拦截常见 Web 攻击并保护 Flag，还将赛场反击自动化，提供了一键流量广播重放、盲打收割与 Flag 自动提交功能，帮助防守方在零宕机的前提下实现绝地反击。
+iWAF 是一款专为 AWD (Attack With Defense) CTF 竞赛设计的、极具防御纵深的高阶 PHP Web 应用防火墙。通过流量解码、内核监控、底层系统调用劫持等多维度防御手段，系统不仅能有效拦截常见 Web 攻击并保护 Flag，还将赛场反击自动化，提供了一键流量广播重放、盲打收割与 Flag 自动提交功能，帮助防守方在零宕机的前提下实现绝地反击。
 
 > **💡 大道至简版 (Minified Version)：**
 > 作者已使用 `php -w` 命令去除了源码中的所有注释和换行符，生成了小体积的高混淆 PHP 文件，该版本已放置在项目的 **Releases** 中。
@@ -119,7 +119,7 @@ php waf.php --ldpreload /var/www/html
            . '.rid{color:#1e2d4a;font-size:10px;margin-top:16px}</style></head>'
            . '<body><div class="box"><div class="icon">&#x1F6AB;</div>'
            . '<div class="title">请求已被拦截</div>'
-           . '<div class="sub">PhoenixWAF 检测到恶意请求</div>'
+           . '<div class="sub">iWAF 检测到恶意请求</div>'
            // . '<div class="rule">' . htmlspecialchars($rule) . '</div>'            <---如果想在拦截界面显示拦截规则，取消这里的注释即可
            . '<div class="sub">如有疑问请联系管理员</div>'
            . '<div class="rid">REF: ' . $rid . '</div>'
