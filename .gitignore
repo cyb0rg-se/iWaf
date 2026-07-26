@@ -1,0 +1,11 @@
+# Minified distribution build — generated from waf.php via `php -w`, shipped via GitHub Releases.
+waf_min.php
+
+# Local editor/OS cruft
+*.swp
+*~
+.DS_Store
+
+# Any locally-compiled LD_PRELOAD artifacts
+*.so
+*.b64

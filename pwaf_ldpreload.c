@@ -1,7 +1,10 @@
 /*
  * ═══════════════════════════════════════════════════════════════════════
- *  PhoenixWAF LD_PRELOAD Protection v3
- *  Hooks: execve, unlink, rename, chmod
+ *  PhoenixWAF LD_PRELOAD Protection v4.0
+ *  Hooks: execve, unlink, rename, chmod, remove, truncate, symlink, link, fopen,
+ *         unlinkat, renameat, fchmodat
+ *  execve: 逐参数全量扫描(堆分配, 无 64 参数/2048 字节填充绕过)
+ *  *at 变体: 补齐现代 coreutils(rm/mv/chmod)走的 unlinkat/renameat/fchmodat
  * ═══════════════════════════════════════════════════════════════════════
  *
  *  编译环境要求:
@@ -100,10 +103,12 @@ static const char *exec_blocked[] = {
     "waf.php",
     ".pwaf",
     "/dev/tcp/",
+    "/dev/udp/",
     "nc -e",
     "nc -lp",
     "ncat -e",
     "mkfifo",
+    "socat",
     "/etc/shadow",
     "/etc/passwd",
     "base64.*decode",
@@ -112,14 +117,23 @@ static const char *exec_blocked[] = {
     "perl -e",
     "ruby -e",
     "php -r",
+    "bash -i",
+    "sh -i",
+    "chattr",       /* 阻止攻击者解锁受保护文件 (chattr -i) */
+    "setfacl",
+    "crontab",
+    "wget ",        /* 远程下载落地 */
+    "curl ",
     NULL
 };
 
 /* ── 受保护文件名 (禁止 unlink/rename/chmod) ── */
 static const char *protected_names[] = {
     "waf.php",
+    "common.inc.php",   /* 隐身部署下 WAF 核心的真实文件名(install 时由 waf.php 重命名而来) */
     ".pwaf.php",
     ".pwaf_bak.php",
+    ".common.bak.php",  /* 核心备份(自愈用) */
     ".htaccess",
     ".user.ini",
     "waf.so",
@@ -180,22 +194,41 @@ int execve(const char *filename, char *const argv[], char *const envp[]) {
     real_execve_t real_execve = (real_execve_t)dlsym(RTLD_NEXT, "execve");
     if (!real_execve) { errno = EACCES; return -1; }
 
-    /* 拼接完整命令行用于关键词匹配 */
-    char cmdline[2048] = {0};
-    if (argv) {
-        for (int i = 0; argv[i] && i < 64; i++) {
-            if (i > 0) strncat(cmdline, " ", sizeof(cmdline) - strlen(cmdline) - 1);
-            strncat(cmdline, argv[i], sizeof(cmdline) - strlen(cmdline) - 1);
+    /* 拼接完整命令行用于关键词匹配。旧实现用定长 2048 缓冲 + 前 64 个参数上限，
+     * 攻击者塞满无害参数即可把恶意关键词挤出扫描窗口绕过。改为按实际长度在堆上
+     * 分配(封顶 1MB 防病理输入)，拼接全部参数，从根本上消除数量/长度绕过；
+     * 多词关键词(如 "nc -e"/"bash -i"/"wget ")仍能跨参数命中。 */
+    size_t total = (filename ? strlen(filename) : 0) + 2;
+    if (argv) for (int i = 0; argv[i] && i < 100000; i++) total += strlen(argv[i]) + 1;
+    if (total > 1048576) total = 1048576;   /* 上限 1MB */
+    char *cmdline = (char *)malloc(total + 1);
+    if (cmdline) {
+        size_t off = 0;
+        for (int i = 0; argv && argv[i] && off < total; i++) {
+            size_t l = strlen(argv[i]);
+            if (off + l + 1 >= total) l = total - off - 1;
+            if ((int)l <= 0) break;
+            memcpy(cmdline + off, argv[i], l); off += l;
+            cmdline[off++] = ' ';
         }
-    }
+        cmdline[off] = '\0';
 
-    /* 检查关键词黑名单 */
-    for (int j = 0; exec_blocked[j]; j++) {
-        if (strstr(cmdline, exec_blocked[j]) != NULL ||
-            (filename && strstr(filename, exec_blocked[j]) != NULL)) {
-            pwaf_log("execve", cmdline);
-            errno = EACCES;
-            return -1;
+        for (int j = 0; exec_blocked[j]; j++) {
+            if (strstr(cmdline, exec_blocked[j]) != NULL ||
+                (filename && strstr(filename, exec_blocked[j]) != NULL)) {
+                pwaf_log("execve", cmdline);
+                free(cmdline);
+                errno = EACCES;
+                return -1;
+            }
+        }
+        free(cmdline);
+    } else {
+        /* 极端内存不足回退：逐参数扫描(多词关键词可能漏，但不崩溃) */
+        for (int j = 0; exec_blocked[j]; j++) {
+            if (filename && strstr(filename, exec_blocked[j])) { errno = EACCES; return -1; }
+            for (int i = 0; argv && argv[i]; i++)
+                if (strstr(argv[i], exec_blocked[j])) { errno = EACCES; return -1; }
         }
     }
 
@@ -304,6 +337,101 @@ int truncate(const char *path, off_t length) {
     }
     return real_truncate(path, length);
 }
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  Hook: symlink — 禁止对受保护文件/flag 建立软链接绕过读取
+ * ═══════════════════════════════════════════════════════════════════════ */
+typedef int (*real_symlink_t)(const char *, const char *);
+
+int symlink(const char *target, const char *linkpath) {
+    real_symlink_t real_symlink = (real_symlink_t)dlsym(RTLD_NEXT, "symlink");
+    if (!real_symlink) { errno = EACCES; return -1; }
+    if (is_protected(target) || is_protected(linkpath) ||
+        (target && strstr(target, "flag")) ||
+        (target && strstr(target, "/etc/passwd")) ||
+        (target && strstr(target, "/etc/shadow"))) {
+        pwaf_log("symlink", target ? target : "?");
+        errno = EPERM;
+        return -1;
+    }
+    return real_symlink(target, linkpath);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  Hook: link — 禁止对受保护文件建立硬链接
+ * ═══════════════════════════════════════════════════════════════════════ */
+typedef int (*real_link_t)(const char *, const char *);
+
+int link(const char *oldpath, const char *newpath) {
+    real_link_t real_link = (real_link_t)dlsym(RTLD_NEXT, "link");
+    if (!real_link) { errno = EACCES; return -1; }
+    if (is_protected(oldpath) || is_protected(newpath) ||
+        (oldpath && strstr(oldpath, "flag"))) {
+        pwaf_log("link", oldpath ? oldpath : "?");
+        errno = EPERM;
+        return -1;
+    }
+    return real_link(oldpath, newpath);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  Hook: fopen — 禁止以写/截断模式打开受保护文件 (阻止 > 覆盖)
+ *  注意: 只拦截 'w'(截断) 模式, 放行 'a'(追加) — WAF 自身日志依赖追加写入
+ * ═══════════════════════════════════════════════════════════════════════ */
+typedef FILE *(*real_fopen_t)(const char *, const char *);
+
+FILE *fopen(const char *path, const char *mode) {
+    real_fopen_t real_fopen = (real_fopen_t)dlsym(RTLD_NEXT, "fopen");
+    if (!real_fopen) { errno = EACCES; return NULL; }
+    if (path && mode && is_protected(path) &&
+        (mode[0] == 'w' || (mode[0] == 'r' && strchr(mode, '+')))) {
+        pwaf_log("fopen_w", path);
+        errno = EPERM;
+        return NULL;
+    }
+    return real_fopen(path, mode);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  Hook: unlinkat / renameat / fchmodat — 现代 coreutils(rm/mv/chmod)走 *at
+ *  变体系统调用，会绕过上面的 unlink/rename/chmod 钩子；这里补齐同等保护。
+ *  均非可变参数、且 WAF 自身运行时从不对受保护文件做这些操作(仅安装器在
+ *  .so 未加载/独立进程时做)，故拦截绝对安全。
+ * ═══════════════════════════════════════════════════════════════════════ */
+typedef int (*real_unlinkat_t)(int, const char *, int);
+int unlinkat(int dirfd, const char *pathname, int flags) {
+    real_unlinkat_t real_unlinkat = (real_unlinkat_t)dlsym(RTLD_NEXT, "unlinkat");
+    if (!real_unlinkat) { errno = EACCES; return -1; }
+    if (is_protected(pathname)) { pwaf_log("unlinkat", pathname); errno = EPERM; return -1; }
+    return real_unlinkat(dirfd, pathname, flags);
+}
+
+typedef int (*real_renameat_t)(int, const char *, int, const char *);
+int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath) {
+    real_renameat_t real_renameat = (real_renameat_t)dlsym(RTLD_NEXT, "renameat");
+    if (!real_renameat) { errno = EACCES; return -1; }
+    if (is_protected(oldpath)) { pwaf_log("renameat", oldpath); errno = EPERM; return -1; }
+    return real_renameat(olddirfd, oldpath, newdirfd, newpath);
+}
+
+typedef int (*real_fchmodat_t)(int, const char *, mode_t, int);
+int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags) {
+    real_fchmodat_t real_fchmodat = (real_fchmodat_t)dlsym(RTLD_NEXT, "fchmodat");
+    if (!real_fchmodat) { errno = EACCES; return -1; }
+    if (is_protected(pathname)) { pwaf_log("fchmodat", pathname); errno = EPERM; return -1; }
+    return real_fchmodat(dirfd, pathname, mode, flags);
+}
+
+/* ── 关于 open()/openat() 写保护 ──────────────────────────────────────────
+ * 有意不 hook open/openat：
+ *  (1) 核心文件(waf.php/common.inc.php/.so/.htaccess/.user.ini)在安装时已用
+ *      chattr +i 锁定，内核对这些文件的 open(O_WRONLY/O_TRUNC)、unlink、rename
+ *      一律拒绝——这是比 LD_PRELOAD 更强的保护(连绕过 LD_PRELOAD 的静态程序也挡)。
+ *  (2) glibc 内部大量走 openat/__openat 等符号，单 hook open() 覆盖不全，易生假安全感。
+ *  (3) WAF 自身要写可变文件(.pwaf.php 配置、日志、自愈重写 common.inc.php)，一个
+ *      过宽的 open() 拦截极易误伤自身运行(与已修复的"chattr 锁配置"同类问题)。
+ * 故文件写保护交给 chattr(内核级) + unlink/rename/truncate/fopen(补充) 组合承担。
+ * ═══════════════════════════════════════════════════════════════════════ */
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  Constructor — .so 加载时自动执行
