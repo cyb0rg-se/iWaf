@@ -68,7 +68,10 @@ if (PHP_SAPI === 'cli') { pwaf_cli($argv); exit(0); }
 try {
     pwaf_run();
 } catch (Exception $e) {
-        @error_log('[PhoenixWAF] Error: ' . $e->getMessage());
+    @error_log('[PhoenixWAF] Error: ' . $e->getMessage());
+} catch (Error $e) {
+    // PHP 7+ Error/TypeError：语法合法，PHP 5 解析为未定义类，不会被抛到这里
+    @error_log('[PhoenixWAF] Error: ' . $e->getMessage());
 }
 
 // SECTION 1: CONFIG
@@ -105,9 +108,19 @@ function pwaf_datadir(array $cfg) {
 
 function &pwaf_cfg() {
     static $c = null;
-    if ($c !== null) return $c;
+    static $mt = -1;
     $p = pwaf_cfg_path();
-    $c = file_exists($p) ? (include $p) : pwaf_default_cfg();
+    $m = file_exists($p) ? (int)@filemtime($p) : 0;
+    if ($c !== null && $m === $mt) return $c;
+    if (file_exists($p)) {
+        if (function_exists('opcache_invalidate')) @opcache_invalidate($p, true);
+        $n = include $p;
+        if (is_array($n)) $c = $n;
+        elseif ($c === null) $c = pwaf_default_cfg();
+    } elseif ($c === null) {
+        $c = pwaf_default_cfg();
+    }
+    $mt = $m;
     return $c;
 }
 
@@ -127,6 +140,9 @@ function pwaf_default_cfg() {
         'fp_mode'        => 'balanced',            // balanced=均衡(推荐,低误报) / strict=严格 / paranoid=偏执(高危场景,零漏报)
         'score_threshold'=> 2,                     // 低置信规则累计命中达到该值才拦截（balanced 模式）
         'static_bypass'  => true,                  // 静态资源(css/js/图片/字体)快速放行，杜绝误报并提速
+        'checker_detect' => true,                  // L8 裁判机自动加白（可关；误加白会让该 IP 绕过扫描）
+        'checker_ttl'    => 1800,                  // 自动加白有效期（秒），0=永不过期
+        'checker_grant'  => [],                    // ip => 授予时间
         'checker_ips'    => [],                            'whitelist'      => [],
         'blacklist'      => [],
         'honeypots'      => ['/flag', '/flag.txt', '/.git/config', '/shell.php',
@@ -182,7 +198,8 @@ function pwaf_patterns() {
                 '/\b(?:order|group)\s+by\b[\s\S]{0,25}(?:\(\s*select|\bcase\b)/i',
         '/\bunion\b.{0,60}\bselect\b/is',
         '/\bselect\b.{0,40}(\*|[\d]+\s*,\s*[\d]+|null\s*,|0x[0-9a-f]+).{0,60}\bfrom\b/is',
-        '/\bselect\b.{0,60}\bfrom\b.{0,40}\b(where|limit|order\s+by|group\s+by|having|union)\b/is',
+        // 要求 WHERE/LIMIT 后出现 SQL 标点或数字，避免 "select X from where we" 这类英文误报
+        '/\bselect\b[\s\S]{0,80}\bfrom\b[\s\S]{0,60}\b(?:where|limit|order\s+by|group\s+by|having|union)\b[\s\S]{0,12}(?:[\'"\d=<>()]|--|#|\/\*)/is',
         '/\b(sleep|benchmark|pg_sleep|waitfor\s+delay|dbms_pipe\.receive_message)\s*\(/i',
         '/\b(extractvalue|updatexml|exp\s*\(\s*~|floor\s*\(\s*rand)\s*\(/i',
         '/\binformation_schema\b/i',
@@ -193,17 +210,19 @@ function pwaf_patterns() {
         '/\b(and|or)\b\s+[\d\'"(]\s*[=<>!]/i',
         '/0x[0-9a-fA-F]{4,}/i',
         '/\bchar\s*\(\s*\d+/i',
-        '/\b(concat|group_concat|concat_ws)\s*\(/i',
         '/\bif\s*\(\s*[\d\'"]/i',
         '/\bunion\s+select\b/i',
         '/\b(version|user|database|schema)\s*\(\s*\)/i',
+        // 引号闭合后直接 SQL 注释 (admin'-- / admin'# )
+        '/[\'"]\s*(?:--\s|--$|#(?:\s|$)|\/\*(?:!|\s|$))/',
         '/\b(?:union|select|insert|update|delete|drop|truncate|alter)\b[\s\S]{0,10}(?:\/\*!?[0-9]{0,5}[\s\S]{0,20}?\*\/)?[\s\S]{0,10}\b(?:from|where|into|set|values)\b/is',
         '/\bunion\b[\s\t\n\r\x0b\x0c\/\*!]*\b(?:all|distinct)?[\s\t\n\r\x0b\x0c\/\*!]*\bselect\b/is',
         '/\b(extractvalue|updatexml|exp|floor|geometrycollection|multipoint|polygon|multipolygon|linestring|multilinestring|json_keys|json_extract|gtid_subset|st_latfromgeohash|st_pointfromgeohash|dbms_utility\.compile_schema)\s*\(/i',
         '/\b(sleep|benchmark|pg_sleep|waitfor\s+delay|dbms_pipe\.receive_message|dbms_lock\.sleep)\s*\(/i',
         '/(?:[=<>!]|[\s\S]\b(?:and|or|xor)\b)[\s\S]{0,20}\b(rlike|regexp|sounds\s+like|like)\b/i',
         '/[\s\S](?:\|\||&&|\^|\*|\/|%|<<|>>)\s*(?:sleep|benchmark|extractvalue|updatexml|pg_sleep)\s*\(/i',
-        '/\b(information_schema|mysql|performance_schema|sys|pg_catalog|pg_toast|sqlite_master|sqlite_temp_master|sysobjects|syscolumns)\b/i',
+        // 不含单独的 mysql/sys：业务文案/连接串极常见，会误拦
+        '/\b(information_schema|performance_schema|pg_catalog|pg_toast|sqlite_master|sqlite_temp_master)\b/i',
         '/\b(load_file|into\s+(?:out|dump)file|load\s+data\s+(?:local\s+)?infile)\b/i',
         '/;\s*(?:drop|alter|create|truncate|insert|update|delete|exec|execute|declare|set)\b/i',
         '/\bxp_(?:cmdshell|regread|regwrite|dirtree|filelist)\b/i',
@@ -214,8 +233,9 @@ function pwaf_patterns() {
 
     'cmdi' => [
         '/\b(system|exec|passthru|shell_exec|popen|proc_open|pcntl_exec)\s*\(/i',
-        '/`[^`]{1,200}`/',
-        '/\$\([^)]{1,200}\)/',
+        // 反引号 / $() 只在内部像命令时拦截，避免 Markdown `code` 与 jQuery $(...) 误报
+        '/`[^`]{0,80}\b(?:cat|tac|id|whoami|wget|curl|nc|ncat|bash|sh|python|perl|php|ls|uname|pwd|flag|chmod|crontab)\b[^`]{0,80}`/i',
+        '/\$\((?:[^)]{0,40}\b)?(?:cat|tac|id|whoami|wget|curl|nc|ncat|bash|sh|python|perl|php|ls|uname|pwd|flag|chmod)[^)]{0,180}\)/i',
         '/[;&|`]\s*(ls|dir|cat|tac|more|less|tail|head|id|whoami|uname|pwd|wget|curl|nc|netcat|bash|sh|python|perl|ruby|php|nmap|ping|find|grep|awk|sed)\b/i',
         '/\|\s*(bash|sh|zsh|ksh|csh|dash|tcsh)\b/i',
         '/(\/bin\/|\/usr\/bin\/|\/usr\/local\/bin\/)(bash|sh|nc|wget|curl|python|perl|ruby|php)/i',
@@ -232,9 +252,13 @@ function pwaf_patterns() {
         '/putenv\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)/i',
         '/\bFFI\s*::\s*(cdef|load|scope)\s*\(/i',
         '/proc_open\s*\(\s*[\'"]?(bash|sh|cmd|powershell)/i',
-        '/\b(system|exec|passthru|shell_exec|popen|proc_open|pcntl_exec|syslog|error_log|mail|mb_send_mail)\s*\(/i',
+        '/\b(?:syslog|error_log|mail|mb_send_mail)\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE)/i',
         '/[;&|`]\s*(ls|dir|cat|tac|more|less|tail|head|id|whoami|uname|pwd|wget|curl|nc|netcat|bash|sh|zsh|python|perl|ruby|php|nmap|ping|find|grep|awk|sed|arp|route|ip|ifconfig)\b/i',
-        '/(\/bin\/|\/usr\/bin\/|\/usr\/local\/bin\/|\/sbin\/)[a-zA-Z*?]{1,15}/i',
+        '/(\/bin\/|\/usr\/bin\/|\/usr\/local\/bin\/|\/sbin\/)(?:bash|sh|dash|zsh|nc|ncat|wget|curl|python|perl|ruby|php|busybox)/i',
+        // 无分号的读 flag / passwd（AWD 常见 ?cmd=cat /flag）
+        '/\b(?:cat|tac|head|tail|nl|more|less|od|xxd|rev|hexdump|strings)\s+[\'"]?\/(?:etc\/(?:passwd|shadow|hosts|issue)|flag|proc\/self|root\/|tmp\/flag|var\/www)/i',
+        '/\b(?:cat|tac|nl|rev|head|tail)\s+[^\s;&|]{0,50}flag/i',
+        '/\{(?:cat|tac|head|tail|nl|rev|id|ls|uname),\/(?:etc|flag|tmp|proc|home|root|var)/i',
         '/\$IFS(?:\[[^\]]+\]|\$\d+)?/i',
         '/\$\{?[a-zA-Z_]+\:[\-\d]+\:\d+\}?/',
         '/\$\[[a-zA-Z0-9_]+\]/',
@@ -328,6 +352,9 @@ function pwaf_patterns() {
         '/\bstr_rot13\s*\(\s*(?:base64_decode|gzinflate|gzuncompress)\s*\(/i',
         '/\bstr_rot13\s*\(\s*[\'"](?:flfgrz|rkrp|cnffgueht|furyy_rkrp|cbcra|cebp_bcra|nffreg|riny)[\'"].*\(/i',
         '/\b(include|require)(_once)?\s*[\(\s][\'"]?\s*(\/flag|\/etc\/passwd|\/etc\/shadow|\/proc\/self)/i',
+        '/\b(?:include|require)(?:_once)?\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE|FILES)/i',
+        '/\b(?:file_get_contents|file_put_contents|readfile|fopen|copy|unlink|highlight_file|show_source)\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE|FILES)/i',
+        '/<!(?:--)?#\s*(?:exec|include|echo|config|printenv)\b/i',
         '/\b(?:eval|assert|create_function|highlight_file|show_source)\s*\(/i',
         '/\b(?:array_map|array_filter|usort|uasort|uksort|array_walk|call_user_func(?:_array)?|register_tick_function|register_shutdown_function)\s*\([^,]+,\s*[\'"]?(?:system|exec|passthru|shell_exec|eval|assert|popen|proc_open)/i',
         '/preg_replace\s*\(\s*[\'"][^\'"]*(?:\/|#|~)[^\'"]{0,64}e[a-z]{0,8}[\'"]/',
@@ -375,6 +402,7 @@ function pwaf_patterns() {
         '/https?:\/\/[^\/\s]*@(?:127\.|10\.|192\.168|169\.254|172\.(?:1[6-9]|2\d|3[01])\.|localhost|0x|0[0-7]|\[)/i',
                 '/(?:ftp|sftp|tftp|gopher|dict|ldap|redis|mongodb)s?:\/\/(?:[^\/\s]*@)?(?:127\.|10\.|192\.168|172\.(?:1[6-9]|2\d|3[01])\.|169\.254|localhost|\[|\d{8,10})/i',
                 '/https?:\/\/(?:[^\/\s]*\.)?(?:localtest\.me|lvh\.me|vcap\.me|localhost|1\.0\.0\.127\.rebind|127\.0\.0\.1\.nip\.io)(?:[\/:]|$)/i',
+        '/https?:\/\/(?:0|00|000|127\.1)(?:[:\/?#]|$)/i',
     ],
 
     'xxe' => [
@@ -475,7 +503,11 @@ function pwaf_patterns() {
         '/(?:phar|zip|rar|ogg|compress\.zlib|compress\.bzip2)\s*:\s*\/\//i',
         '/php:\/\/filter\/[^,\s]*(?:convert\.iconv|convert\.base64|zlib\.|string\.)/i',
         '/(?:dict|gopher|tftp|ldap|jar|netdoc|mailto):\s*\/\//i',
-        '/ssh2\.(?:exec|shell|tunnel|sftp|scp)\s*:\s*\/\//i',                   '/jar:\s*(?:https?|ftp|file):/i',                                       '/\$\{jndi:/i',                                                         '/\$\{(?:[^}]{0,40}\$\{[^}]*:-|(?:lower|upper|env|sys|date|java|main|ctx):)/i',         '/\$\{jndi:(?:ldap|rmi|dns|iiop|corba|nis)/i',                          '/\bpearcmd\b|\bpear\/pearcmd/i',                                       '/session_upload_progress|PHP_SESSION_UPLOAD_PROGRESS/i',           ],
+        '/ssh2\.(?:exec|shell|tunnel|sftp|scp)\s*:\s*\/\//i',                   '/jar:\s*(?:https?|ftp|file):/i',                                       '/\$\{jndi:/i',                                                         '/\$\{(?:[^}]{0,40}\$\{[^}]*:-|(?:lower|upper|env|sys|date|java|main|ctx):)/i',         '/\$\{jndi:(?:ldap|rmi|dns|iiop|corba|nis)/i',                          '/\bpearcmd\b|\bpear\/pearcmd/i',
+        '/session_upload_progress|PHP_SESSION_UPLOAD_PROGRESS/i',
+        '/\(\s*[|&]\s*\(\s*\w+\s*=\s*\*/',
+        '/php:\/\/filter\/(?:read|write|resource)=/i',
+    ],
     ];
 
     foreach ($p as $key => $patterns) {
@@ -504,6 +536,7 @@ function pwaf_lowconf() {
         '/\border\s+by\s+\d+/i'                                                         => 'sql_order',
         '/\bif\s*\(\s*[\d\'"]/i'                                                        => 'sql_if',
         '/(?:[=<>!]|[\s\S]\b(?:and|or|xor)\b)[\s\S]{0,20}\b(rlike|regexp|sounds\s+like|like)\b/i' => 'sql_like',
+        '/\b(version|user|database|schema)\s*\(\s*\)/i'                                  => 'sql_info',
         // XSS 中易误报的宽泛特征
         '/\bon\w+\s*=/i'                                                                => 'xss_on',
         '/\bon[a-zA-Z]{3,20}[\s\n]*=/i'                                                 => 'xss_on',
@@ -545,8 +578,22 @@ function pwaf_decode($v) {
                         $vg = preg_replace('/\/\*!?(?:\d{1,6})?(.*?)\*\//s', '$1', $r);
             if ($vg !== $r && $vg !== $vc) { $extra[] = $vg; $extra[] = strtolower($vg); }
         }
+        // /*!50000UN*/ION/*!50000SELE*/CT → UNIONSELECT → UNION SELECT
+        foreach (array($n, isset($vc) ? $vc : '', isset($vg) ? $vg : '') as $glued) {
+            if ($glued === '') continue;
+            $ug = pwaf_sql_unglue($glued);
+            if ($ug !== $glued) { $extra[] = $ug; $extra[] = strtolower($ug); }
+        }
+        unset($vc, $vg);
     }
     return array_unique(array_merge($out, $extra));
+}
+
+// 把粘在一起的 SQL 关键字拆开（注释去壳后 UNIONSELECT / SELECTFROM）
+function pwaf_sql_unglue($v) {
+    $kw = 'union|select|from|where|and|or|xor|insert|update|delete|drop|alter|sleep|benchmark|concat|group_concat|extractvalue|updatexml|information_schema|load_file|outfile|dumpfile|limit|having|into';
+    $n = preg_replace('/(' . $kw . ')(?=(?:' . $kw . '))/i', '$1 ', $v);
+    return ($n === null) ? $v : $n;
 }
 
 function pwaf_decode_once($v) {
@@ -655,6 +702,38 @@ function pwaf_decode_once($v) {
         }
     }
 
+    // CHAR(115,121,115,116,101,109) / chr(115).chr(121)... → system
+    if (preg_match('/\b(?:char|chr)\s*\(\s*\d{1,3}(?:\s*,\s*\d{1,3}){2,}\s*\)/i', $v)) {
+        $ch = preg_replace_callback('/\b(?:char|chr)\s*\(\s*(\d{1,3}(?:\s*,\s*\d{1,3}){2,})\s*\)/i', function($m) {
+            $s = '';
+            foreach (preg_split('/\s*,\s*/', $m[1]) as $n) {
+                $n = (int)$n;
+                if ($n < 32 || $n > 126) return $m[0];
+                $s .= chr($n);
+            }
+            return $s;
+        }, $v);
+        if ($ch !== $v) $out[] = $ch;
+    }
+    if (preg_match('/(?:chr\s*\(\s*\d{1,3}\s*\)\s*\.\s*){2,}chr\s*\(\s*\d{1,3}\s*\)/i', $v)) {
+        $ch2 = preg_replace_callback('/chr\s*\(\s*(\d{1,3})\s*\)/i', function($m) {
+            $n = (int)$m[1];
+            return ($n >= 32 && $n <= 126) ? chr($n) : $m[0];
+        }, $v);
+        $ch2 = str_replace('.', '', $ch2);
+        if ($ch2 !== $v && $ch2 !== '') $out[] = $ch2;
+    }
+
+    // 'sys'.'tem' / "sys"."tem" 拼接还原
+    if (strpos($v, '.') !== false && (strpos($v, "'") !== false || strpos($v, '"') !== false)) {
+        $cc = $v; $prev = null; $guard = 8;
+        while ($cc !== $prev && $guard--) {
+            $prev = $cc;
+            $cc = preg_replace('/([\'"])([a-zA-Z0-9_\\\\x]{1,32})\1\s*\.\s*([\'"])([a-zA-Z0-9_\\\\x]{1,32})\3/', '$1$2$4$1', $cc);
+        }
+        if ($cc !== $v) $out[] = $cc;
+    }
+
     return $out;
 }
 
@@ -736,7 +815,12 @@ function pwaf_inputs() {
         foreach ($tmps as $i => $tmp) {
             if (!$tmp || !is_uploaded_file($tmp)) continue;
             $inputs[] = ['src'=>'FILE_NAME',    'key'=>$field, 'val'=>(string)((isset($names[$i]) ? $names[$i] : ''))];
-            $content  = @file_get_contents($tmp, false, null, 0, 8192);
+            $sz = @filesize($tmp);
+            $content = @file_get_contents($tmp, false, null, 0, 8192);
+            if ($content !== false && $sz !== false && $sz > 8192) {
+                $tail = @file_get_contents($tmp, false, null, max(0, $sz - 8192), 8192);
+                if ($tail !== false) $content .= "\n" . $tail;
+            }
             if ($content !== false) $inputs[] = ['src'=>'FILE_BODY', 'key'=>$field, 'val'=>$content];
         }
     }
@@ -861,6 +945,8 @@ function pwaf_run() {
     $GLOBALS['_PWAF_SERVER'] = $_SERVER;
 
     $cfg = &pwaf_cfg();
+    // 停用拦截时仍做 L7/L9：否则面板「停用 WAF」等于完整性/自愈一起死
+    register_shutdown_function(function() use (&$cfg) { pwaf_periodic($cfg); });
     if (empty($cfg['enabled'])) return;
 
     $t0 = microtime(true);
@@ -901,27 +987,30 @@ function pwaf_run() {
         pwaf_panel($cfg, $ip); exit;
     }
 
-        pwaf_checker_detect($cfg, $ip);
+    pwaf_checker_prune($cfg);
+
+    // 危险上传对裁判机/白名单同样拦截：巡检不会传 .php，传了就是打手
+    pwaf_block_dangerous_uploads($cfg, $ip, $t0);
 
         if (in_array($ip, $cfg['whitelist'], true)) {
         pwaf_access_log($cfg, $ip, 'pass', 'whitelist', $t0); return;
     }
-    if (in_array($ip, $cfg['checker_ips'], true)) {
-        pwaf_access_log($cfg, $ip, 'pass', 'checker', $t0); return;
-    }
+
+    $is_checker = in_array($ip, $cfg['checker_ips'], true);
 
         if (in_array($ip, $cfg['blacklist'], true)) {
         pwaf_block($cfg, $ip, 'blacklist', 'ip', $ip, $t0); return;
     }
 
-        if (pwaf_rate_check($cfg, $ip)) {
+        if (!$is_checker && pwaf_rate_check($cfg, $ip)) {
         pwaf_block($cfg, $ip, 'rate_limit', 'ip', $ip, $t0); return;
     }
 
         $uri = parse_url((isset($GLOBALS['_PWAF_SERVER']['REQUEST_URI']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_URI'] : '/'), PHP_URL_PATH) ?: '/';
     foreach ($cfg['honeypots'] as $hp) {
-        if ($uri === $hp || strpos($uri, $hp) === 0) {
+        if (pwaf_uri_is_honeypot($uri, $hp)) {
             pwaf_log($cfg, $ip, 'honeypot', 'uri', $uri, 'honeypot');
+            pwaf_checker_deny($ip);
             pwaf_auto_ban($cfg, $ip);
             header('Content-Type: text/plain');
             echo $cfg['fake_flag'];
@@ -941,9 +1030,14 @@ function pwaf_run() {
     $rules  = $cfg['rules'];
     $hit = pwaf_scan_inputs($inputs, $cfg);
     if ($hit !== null) {
+        // 加白后仍全量扫描。高置信视为打手：撤销加白；低置信(_score)仍拦但不永久剥夺加白资格
+        if ($is_checker && strpos($hit['rule'], '_score') === false) pwaf_checker_revoke($cfg, $ip);
         pwaf_block($cfg, $ip, $hit['rule'], $hit['param'], $hit['payload'], $t0);
         return;
     }
+
+    // 先扫描再计数：本包已放行才给巡检积分；满阈值只影响后续请求
+    pwaf_checker_detect($cfg, $ip);
 
         if (!empty($rules['response'])) {
         $GLOBALS['_PWAF_OB_FLUSHED'] = false;
@@ -996,21 +1090,18 @@ function pwaf_run() {
     }
 
         pwaf_access_log($cfg, $ip, 'pass', '', $t0);
-
-        // 每 5 秒检查一次（用时间戳文件避免并发重复执行）
-        // JSON，两者格式不兼容会互相破坏（周期任务把 JSON 读成 (int)0 → 每次请求都跑完整性
-        $tf = (isset($cfg['datadir']) ? $cfg['datadir'] : dirname(PWAF_SELF)) . '/.pwaf_tick';
-    $last = (int)@file_get_contents($tf);
-    if (time() - $last >= 5) {
-        @file_put_contents($tf, time(), LOCK_EX);
-                if (!empty($cfg['backup']) && file_exists($cfg['backup']) && !file_exists(PWAF_SELF)) {
-            @copy($cfg['backup'], PWAF_SELF);
-        }
-                pwaf_integrity_check($cfg);
-    }
 }
 
 // ── 静态资源判定（快速放行）──────────────────────────────────────────────────
+function pwaf_uri_is_honeypot($uri, $hp) {
+    if ($hp === '' || $uri === '') return false;
+    if ($uri === $hp) return true;
+    $hp = rtrim($hp, '/');
+    if ($hp === '') return false;
+    // /flag 只匹配 /flag 与 /flag/...，不匹配 /flag.php
+    return strpos($uri, $hp . '/') === 0;
+}
+
 function pwaf_is_static($uri) {
         $path = $uri;
     $q = strpos($path, '?'); if ($q !== false) $path = substr($path, 0, $q);
@@ -1036,39 +1127,153 @@ function pwaf_ip() {
     return '0.0.0.0';
 }
 
-// Heuristic: checker typically hits the same path repeatedly with clean requests
-// We whitelist IPs that make requests with no suspicious params
-function pwaf_checker_detect(array &$cfg, $ip) {
-        if (in_array($ip, $cfg['checker_ips'], true)) return;
-    if (in_array($ip, $cfg['blacklist'], true)) return;
+function pwaf_chk_path() {
+    return dirname(PWAF_SELF) . '/.pwaf_chk';
+}
 
-    // Only consider IPs with no GET/POST params (checker usually hits root cleanly)
+function pwaf_chk_normalize($raw) {
+    if (!is_array($raw)) return array('hits' => array(), 'deny' => array());
+    if (isset($raw['hits']) || isset($raw['deny'])) {
+        return array(
+            'hits' => (isset($raw['hits']) && is_array($raw['hits'])) ? $raw['hits'] : array(),
+            'deny' => (isset($raw['deny']) && is_array($raw['deny'])) ? $raw['deny'] : array(),
+        );
+    }
+    $hits = array();
+    foreach ($raw as $k => $v) {
+        if (is_array($v) && isset($v['n'])) $hits[$k] = $v;
+    }
+    return array('hits' => $hits, 'deny' => array());
+}
+
+function pwaf_checker_denied($ip) {
+    $p = pwaf_chk_path();
+    if (!file_exists($p)) return false;
+    $st = pwaf_chk_normalize(json_decode(@file_get_contents($p), true));
+    return isset($st['deny'][$ip]);
+}
+
+function pwaf_checker_deny($ip) {
+    if (!$ip || $ip === '0.0.0.0') return;
+    $p = pwaf_chk_path();
+    $fp = @fopen($p, 'c+');
+    if (!$fp) return;
+    flock($fp, LOCK_EX);
+    $st = pwaf_chk_normalize(json_decode(stream_get_contents($fp), true));
+    $st['deny'][$ip] = time();
+    unset($st['hits'][$ip]);
+    ftruncate($fp, 0); rewind($fp);
+    fwrite($fp, json_encode($st));
+    flock($fp, LOCK_UN); fclose($fp);
+}
+
+function pwaf_checker_revoke(array &$cfg, $ip) {
+    $cfg['checker_ips'] = array_values(array_filter($cfg['checker_ips'], function($v) use ($ip) { return $v !== $ip; }));
+    if (isset($cfg['checker_grant'][$ip])) unset($cfg['checker_grant'][$ip]);
+    pwaf_checker_deny($ip);
+    pwaf_save_cfg($cfg);
+}
+
+function pwaf_checker_prune(array &$cfg) {
+    $ttl = isset($cfg['checker_ttl']) ? (int)$cfg['checker_ttl'] : 1800;
+    if ($ttl <= 0 || empty($cfg['checker_ips'])) return;
+    $since = (isset($cfg['checker_grant']) && is_array($cfg['checker_grant'])) ? $cfg['checker_grant'] : array();
+    $now = time();
+    $keep = array();
+    $grant = array();
+    $changed = false;
+    foreach ($cfg['checker_ips'] as $cip) {
+        $t = isset($since[$cip]) ? (int)$since[$cip] : $now;
+        if ($now - $t > $ttl) { $changed = true; continue; }
+        $keep[] = $cip;
+        $grant[$cip] = $t;
+        if (!isset($since[$cip])) $changed = true;
+    }
+    if ($changed || count($keep) !== count($cfg['checker_ips'])) {
+        $cfg['checker_ips'] = $keep;
+        $cfg['checker_grant'] = $grant;
+        pwaf_save_cfg($cfg);
+    }
+}
+
+// L8：只在请求已经扫描放行后计数。被拦过的 IP 永远不加白；满阈值不作用于本包。
+function pwaf_checker_detect(array &$cfg, $ip) {
+    if (isset($cfg['checker_detect']) && empty($cfg['checker_detect'])) return;
+    if (in_array($ip, $cfg['checker_ips'], true)) return;
+    if (in_array($ip, $cfg['blacklist'], true)) return;
+    if (in_array($ip, $cfg['whitelist'], true)) return;
+    if (pwaf_checker_denied($ip)) return;
     if (!empty($GLOBALS['_PWAF_GET']) || !empty($GLOBALS['_PWAF_POST'])) return;
+    if (!empty($GLOBALS['_PWAF_FILES'])) return;
 
     $uri = (isset($GLOBALS['_PWAF_SERVER']['REQUEST_URI']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_URI'] : '/');
-        if (!preg_match('#^/(index\.php)?(\?.*)?$#', $uri)) return;
+    $path = parse_url($uri, PHP_URL_PATH);
+    if ($path === false || $path === null) $path = $uri;
+    if ($path !== '/' && strcasecmp($path, '/index.php') !== 0) return;
 
-        $track_file = dirname(PWAF_SELF) . '/.pwaf_chk';
-    $data = [];
-    if (file_exists($track_file)) {
-        $data = json_decode(@file_get_contents($track_file), true) ?: [];
+    $p = pwaf_chk_path();
+    $fp = @fopen($p, 'c+');
+    if (!$fp) return;
+    flock($fp, LOCK_EX);
+    $st = pwaf_chk_normalize(json_decode(stream_get_contents($fp), true));
+    $now = time();
+    foreach ($st['hits'] as $k => $v) {
+        $lt = isset($v['t']) ? (int)$v['t'] : 0;
+        if ($now - $lt > 600) unset($st['hits'][$k]);
     }
-        $now = time();
-    foreach ($data as $k => $v) {
-        if ($now - ((isset($v['t']) ? $v['t'] : 0)) > 600) unset($data[$k]);
+    if (!isset($st['hits'][$ip])) $st['hits'][$ip] = array('t' => $now, 'n' => 0, 't0' => $now);
+    $st['hits'][$ip]['n']++;
+    $st['hits'][$ip]['t'] = $now;
+    if (!isset($st['hits'][$ip]['t0'])) $st['hits'][$ip]['t0'] = $now;
+    $n = (int)$st['hits'][$ip]['n'];
+    $span = $now - (int)$st['hits'][$ip]['t0'];
+    $grant = false;
+    // 至少 5 次且跨度 ≥20s：巡检是周期性探活，打手连刷 3 次 instant 加白
+    if ($n >= 5 && $span >= 20) {
+        $grant = true;
+        unset($st['hits'][$ip]);
     }
-    if (!isset($data[$ip])) {
-        $data[$ip] = ['t' => $now, 'n' => 0];
-    }
-    $data[$ip]['n']++;
+    ftruncate($fp, 0); rewind($fp);
+    fwrite($fp, json_encode($st));
+    flock($fp, LOCK_UN); fclose($fp);
 
-        if ($data[$ip]['n'] >= 3) {
+    if ($grant) {
         $cfg['checker_ips'][] = $ip;
+        if (!isset($cfg['checker_grant']) || !is_array($cfg['checker_grant'])) $cfg['checker_grant'] = array();
+        $cfg['checker_grant'][$ip] = $now;
         pwaf_save_cfg($cfg);
-        unset($data[$ip]);
         pwaf_log($cfg, $ip, 'checker_whitelist', 'ip', $ip, 'whitelist');
     }
-    @file_put_contents($track_file, json_encode($data), LOCK_EX);
+}
+
+function pwaf_dangerous_upload_name($name) {
+    $base = strtolower(basename(str_replace('\\', '/', (string)$name)));
+    if ($base === '') return false;
+    if ($base === '.htaccess' || $base === '.htpasswd' || $base === '.user.ini' || $base === 'web.config') return true;
+    return (bool)preg_match('/\.(?:php[0-9]?|phtml|phar|php-s|shtml|shtm|cgi|pl|py|rb|asp|aspx|jsp|jspx|cfm)(?:\.[^.]+)?$/i', $base);
+}
+
+function pwaf_block_dangerous_uploads(array $cfg, $ip, $t0) {
+    if (empty($GLOBALS['_PWAF_FILES'])) return;
+    foreach ($GLOBALS['_PWAF_FILES'] as $field => $f) {
+        $names = is_array($f['name']) ? $f['name'] : array($f['name']);
+        foreach ($names as $name) {
+            if (pwaf_dangerous_upload_name($name)) {
+                pwaf_block($cfg, $ip, 'upload', 'FILE_NAME:' . $field, (string)$name, $t0);
+            }
+        }
+    }
+}
+
+function pwaf_periodic(array $cfg) {
+    $tf = (isset($cfg['datadir']) ? $cfg['datadir'] : dirname(PWAF_SELF)) . '/.pwaf_tick';
+    $last = (int)@file_get_contents($tf);
+    if (time() - $last < 5) return;
+    @file_put_contents($tf, (string)time(), LOCK_EX);
+    if (!empty($cfg['backup']) && file_exists($cfg['backup']) && !file_exists(PWAF_SELF)) {
+        @copy($cfg['backup'], PWAF_SELF);
+    }
+    pwaf_integrity_check($cfg);
 }
 
 function pwaf_rate_check(array &$cfg, $ip) {
@@ -1114,6 +1319,9 @@ function pwaf_auto_ban(array &$cfg, $ip) {
 
 function pwaf_block(array $cfg, $ip, $rule, $param, $payload, $t0 = 0.0) {
     pwaf_log($cfg, $ip, $rule, $param, $payload, 'block', $t0);
+    if ($rule !== 'rate_limit' && $rule !== 'blacklist' && strpos($rule, '_score') === false) {
+        pwaf_checker_deny($ip);
+    }
 
         if ($rule === 'upload' && !empty($cfg['fake_upload'])) {
                 $backup_dir = dirname((isset($cfg['log']) ? $cfg['log'] : PWAF_SELF)) . '/.pwaf_uploads';
@@ -1803,6 +2011,208 @@ function pwaf_response_hook($out, array $cfg, $ip) {
 }
 
 // 扫描所有文件（PHP + 配置 + 脚本 + 数据库 + 可执行），检测新增/篡改（包含防刷屏去重）
+function pwaf_is_linux() {
+    return strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN';
+}
+
+function pwaf_norm_path($p) {
+    return rtrim(str_replace('\\', '/', (string)$p), '/');
+}
+
+function pwaf_path_under_webroot($path, array $cfg) {
+    $wr = isset($cfg['webroot']) ? $cfg['webroot'] : '';
+    if ($wr === '' || !is_dir($wr)) return false;
+    if (strpos($path, "\0") !== false) return false;
+    $root = realpath($wr);
+    if ($root === false) return false;
+    $root = pwaf_norm_path($root);
+    $real = realpath($path);
+    if ($real === false) {
+        $dir = realpath(dirname($path));
+        if ($dir === false) return false;
+        $real = pwaf_norm_path($dir) . '/' . basename($path);
+    } else {
+        $real = pwaf_norm_path($real);
+    }
+    if ($real === $root) return false;
+    return strpos($real . '/', $root . '/') === 0;
+}
+
+function pwaf_is_protected_waf_path($path, array $cfg) {
+    $base = strtolower(basename(str_replace('\\', '/', $path)));
+    $prot = array('waf.php','common.inc.php','.pwaf.php','.pwaf_bak.php','.common.bak.php',
+        '.htaccess','.user.ini','waf.so','.pwaf_watcher.sh','.pwaf_watcher.pid',
+        '.pwaf_log','.pwaf_int','.pwaf_rate','.pwaf_chk','.pwaf_tick','.pwaf_ptr');
+    if (in_array($base, $prot, true)) return true;
+    if (strpos($base, '.pwaf') === 0 || strpos($base, '.sess_') === 0 || strpos($base, '.tmp_') === 0) return true;
+    $dd = isset($cfg['datadir']) ? pwaf_norm_path($cfg['datadir']) : '';
+    $p = pwaf_norm_path(realpath($path) ? realpath($path) : $path);
+    if ($dd !== '' && ($p === $dd || strpos($p . '/', $dd . '/') === 0)) return true;
+    return false;
+}
+
+function pwaf_integrity_forget(array $cfg, $path) {
+    $db = isset($cfg['integrity_db']) ? $cfg['integrity_db'] : (pwaf_datadir($cfg) . '/.pwaf_int');
+    if (!file_exists($db)) return;
+    $stored = json_decode(@file_get_contents($db), true);
+    if (!is_array($stored) || empty($stored['a'])) return;
+    $keys = array($path, str_replace('/', '\\', $path), str_replace('\\', '/', $path));
+    $rp = realpath($path);
+    if ($rp) { $keys[] = $rp; $keys[] = str_replace('\\', '/', $rp); }
+    foreach ($keys as $k) {
+        if (isset($stored['a'][$k])) unset($stored['a'][$k]);
+    }
+    @file_put_contents($db, json_encode($stored), LOCK_EX);
+}
+
+function pwaf_kill_file_holders($path) {
+    $log = array();
+    if (!pwaf_is_linux() || !file_exists($path)) return $log;
+    $keep = array('apache2'=>1,'httpd'=>1,'nginx'=>1,'php-fpm'=>1,'sshd'=>1,'systemd'=>1,'init'=>1);
+    $esc = escapeshellarg($path);
+    $raw = array();
+    @exec('lsof -t ' . $esc . ' 2>/dev/null', $raw);
+    $fu = array();
+    @exec('fuser ' . $esc . ' 2>/dev/null', $fu);
+    foreach ($fu as $line) {
+        foreach (preg_split('/\s+/', trim($line)) as $x) {
+            if (ctype_digit($x)) $raw[] = $x;
+        }
+    }
+    $seen = array();
+    foreach (glob('/proc/[0-9]*') ?: array() as $pr) {
+        $pid = (int)basename($pr);
+        if ($pid <= 1 || $pid === getmypid()) continue;
+        $comm = strtolower(trim((string)@file_get_contents($pr . '/comm')));
+        if (isset($keep[$comm])) continue;
+        $hit = false;
+        foreach (glob($pr . '/fd/*') ?: array() as $fd) {
+            $lk = @readlink($fd);
+            if ($lk === $path) { $hit = true; break; }
+        }
+        if (!$hit) {
+            $cmd = str_replace("\0", ' ', (string)@file_get_contents($pr . '/cmdline'));
+            if ($cmd !== '' && strpos($cmd, basename($path)) !== false
+                && preg_match('/while|inotify|forever|nohup|usleep|sleep/i', $cmd)) {
+                $hit = true;
+            }
+        }
+        if ($hit) $raw[] = $pid;
+    }
+    foreach ($raw as $p) {
+        $pid = (int)$p;
+        if ($pid <= 1 || $pid === getmypid() || isset($seen[$pid])) continue;
+        $comm = strtolower(trim((string)@file_get_contents('/proc/' . $pid . '/comm')));
+        if (isset($keep[$comm])) continue;
+        @exec('kill -9 ' . $pid . ' 2>/dev/null');
+        $seen[$pid] = 1;
+        $log[] = 'kill ' . $pid . ($comm !== '' ? '/' . $comm : '');
+    }
+    return $log;
+}
+
+// $force=false 普通删除；true 强力删除（解锁 chattr、杀占文件进程、占坑防写回）
+function pwaf_integrity_delete(array $cfg, $path, $force) {
+    $path = trim(str_replace("\0", '', $path));
+    if ($path === '' || !pwaf_path_under_webroot($path, $cfg)) {
+        return array(false, '路径非法或不在 webroot 内');
+    }
+    if (pwaf_is_protected_waf_path($path, $cfg)) {
+        return array(false, '拒绝删除 WAF 核心文件');
+    }
+    $steps = array();
+    $linux = pwaf_is_linux();
+    $exists = file_exists($path) || is_link($path) || is_dir($path);
+
+    if ($force && $linux && $exists) {
+        @exec('chattr -ia ' . escapeshellarg($path) . ' 2>/dev/null');
+        @exec('chattr -R -ia ' . escapeshellarg($path) . ' 2>/dev/null');
+        @exec('setfacl -b ' . escapeshellarg($path) . ' 2>/dev/null');
+        $steps[] = 'chattr -ia / setfacl -b';
+        $kl = pwaf_kill_file_holders($path);
+        if ($kl) $steps[] = implode(',', $kl);
+    }
+
+    if (is_file($path) || is_link($path)) {
+        @chmod($path, 0777);
+        if ($force) {
+            @file_put_contents($path, "<?php exit(); ?>\n");
+            $steps[] = 'overwrite exit()';
+        }
+        if (@unlink($path)) {
+            $steps[] = 'unlink';
+        } elseif ($linux) {
+            @exec('rm -f ' . escapeshellarg($path) . ' 2>/dev/null');
+            $steps[] = 'rm -f';
+        }
+    } elseif (is_dir($path) && $force) {
+        if ($linux) @exec('chattr -ia ' . escapeshellarg($path) . ' 2>/dev/null');
+        @rmdir($path);
+        if (is_dir($path) && $linux) {
+            @exec('rmdir ' . escapeshellarg($path) . ' 2>/dev/null');
+        }
+        $steps[] = 'rmdir occupy-stub';
+    }
+
+    if ($force) {
+        if (file_exists($path) || is_dir($path)) {
+            if (is_file($path)) {
+                @file_put_contents($path, "<?php exit(); ?>\n");
+                if ($linux) @exec('chattr +i ' . escapeshellarg($path) . ' 2>/dev/null');
+                $steps[] = 'lock exit stub chattr +i';
+            }
+        } else {
+            if (@mkdir($path, 0555)) {
+                if ($linux) @exec('chattr +i ' . escapeshellarg($path) . ' 2>/dev/null');
+                $steps[] = 'occupy dir + chattr +i';
+            } else {
+                @file_put_contents($path, "<?php exit(); ?>\n");
+                if ($linux) @exec('chattr +i ' . escapeshellarg($path) . ' 2>/dev/null');
+                $steps[] = 'occupy file + chattr +i';
+            }
+        }
+    }
+
+    $gone = !file_exists($path) && !is_link($path);
+    $dirlock = is_dir($path);
+    $stub = is_file($path) && (int)@filesize($path) <= 32;
+    if (!$gone && !$dirlock && !$stub && !$force) {
+        return array(false, '删除失败（可能 chattr +i / 权限不足，请用强力删除）');
+    }
+    pwaf_integrity_forget($cfg, $path);
+    $act = $force ? 'force_deleted' : 'deleted';
+    $rule = $force ? 'integrity_force_del' : 'integrity_del';
+    pwaf_log($cfg, 'SYS', $rule, 'file', $path, $act);
+    $ok = $gone || $dirlock || ($force && $stub);
+    $msg = ($force ? '强力删除: ' : '删除: ') . $path . ' → ' . ($gone ? '已删除' : ($dirlock ? '已占坑(目录+不可改)' : '已写成 exit 并锁定'));
+    if ($steps) $msg .= ' [' . implode(' | ', $steps) . ']';
+    return array($ok, $msg);
+}
+
+function pwaf_inject_waf_tag($file) {
+    if (!is_file($file) || !is_readable($file) || !is_writable($file)) return false;
+    $c = @file_get_contents($file);
+    if ($c === false || $c === '') return false;
+    if (strpos($c, '@internal_handler') !== false) return false;
+    if (strpos($c, 'function pwaf_run') !== false) return false;
+    $tag = "<?php /* @internal_handler */ @include_once '" . str_replace("'", "\\'", PWAF_SELF) . "'; ?>";
+    $new = preg_replace('/^<\?php/i', $tag . "\n<?php", $c, 1, $count);
+    if (!$count) $new = $tag . "\n" . $c;
+    return @file_put_contents($file, $new, LOCK_EX) !== false;
+}
+
+function pwaf_looks_like_shell($path) {
+    $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+    if (!in_array($ext, array('php','php3','php4','php5','php7','phtml','phar','inc'), true)) return false;
+    $c = @file_get_contents($path, false, null, 0, 8192);
+    if ($c === false || $c === '') return false;
+    if (strpos($c, '@internal_handler') !== false) return false;
+    if (strpos($c, 'function pwaf_run') !== false) return false;
+    if (!preg_match('/<\?(?:php|=)/i', $c)) return false;
+    return (bool)preg_match('/\b(?:eval|assert|system|exec|passthru|shell_exec|popen|proc_open|pcntl_exec)\s*\(/i', $c)
+        || (bool)preg_match('/\$_(?:GET|POST|REQUEST|COOKIE|FILES)\s*\[/', $c);
+}
+
 function pwaf_integrity_check(array $cfg) {
     $db      = (isset($cfg['integrity_db']) ? $cfg['integrity_db'] : (pwaf_datadir($cfg) . '/.pwaf_int'));
     $webroot = (isset($cfg['webroot']) ? $cfg['webroot'] : '');
@@ -1810,25 +2220,48 @@ function pwaf_integrity_check(array $cfg) {
 
     $stored  = json_decode(@file_get_contents($db), true) ?: [];
     $base    = (isset($stored['b']) ? $stored['b'] : []);
-    $alerted = (isset($stored['a']) ? $stored['a'] : []);     $lp      = (isset($cfg['log']) ? $cfg['log'] : (pwaf_datadir($cfg) . '/.pwaf_log'));
+    $alerted = (isset($stored['a']) ? $stored['a'] : []);
+    $lp      = (isset($cfg['log']) ? $cfg['log'] : (pwaf_datadir($cfg) . '/.pwaf_log'));
     $db_changed = false;
 
-    foreach (pwaf_all_files($webroot) as $file) {
-        $h = hash_file('sha256', $file);
-        
-        if (!isset($base[$file])) {
+    foreach (pwaf_all_files($webroot, $cfg) as $file) {
+        $h = @hash_file('sha256', $file);
+        if ($h === false) continue;
+        $is_new = !isset($base[$file]);
+        $is_mod = (!$is_new && $base[$file] !== $h);
+
+        if ($is_new && pwaf_looks_like_shell($file)) {
+            @file_put_contents($file, "<?php exit(); ?>\n");
+            $h2 = @hash_file('sha256', $file);
+            $e = json_encode(array('ts'=>time(),'dt'=>date('Y-m-d H:i:s'),'ip'=>'SYS','method'=>'INT','uri'=>$file,
+                'rule'=>'integrity_shell','payload'=>($h2 ? $h2 : $h),'param'=>'file','ua'=>'','action'=>'neutralized'),
+                JSON_UNESCAPED_UNICODE) . "\n";
+            @file_put_contents($lp, $e, FILE_APPEND);
+            $alerted[$file] = $h2 ? $h2 : $h;
+            $db_changed = true;
+            continue;
+        }
+
+        if ($is_new) {
+            $extn = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+            if (in_array($extn, array('php','php3','php4','php5','php7','phtml','inc'), true)) {
+                pwaf_inject_waf_tag($file);
+            }
+        }
+
+        if ($is_new) {
             if (!isset($alerted[$file]) || $alerted[$file] !== $h) {
-                $e = json_encode(['ts'=>time(),'dt'=>date('Y-m-d H:i:s'),'ip'=>'SYS','method'=>'INT','uri'=>$file,
-                    'rule'=>'integrity_new','payload'=>$h,'param'=>'file','ua'=>'','action'=>'alert'],
+                $e = json_encode(array('ts'=>time(),'dt'=>date('Y-m-d H:i:s'),'ip'=>'SYS','method'=>'INT','uri'=>$file,
+                    'rule'=>'integrity_new','payload'=>$h,'param'=>'file','ua'=>'','action'=>'alert'),
                     JSON_UNESCAPED_UNICODE) . "\n";
                 @file_put_contents($lp, $e, FILE_APPEND);
                 $alerted[$file] = $h;
                 $db_changed = true;
             }
-        } elseif ($base[$file] !== $h) {
+        } elseif ($is_mod) {
             if (!isset($alerted[$file]) || $alerted[$file] !== $h) {
-                $e = json_encode(['ts'=>time(),'dt'=>date('Y-m-d H:i:s'),'ip'=>'SYS','method'=>'INT','uri'=>$file,
-                    'rule'=>'integrity_modified','payload'=>$h,'param'=>'file','ua'=>'','action'=>'alert'],
+                $e = json_encode(array('ts'=>time(),'dt'=>date('Y-m-d H:i:s'),'ip'=>'SYS','method'=>'INT','uri'=>$file,
+                    'rule'=>'integrity_modified','payload'=>$h,'param'=>'file','ua'=>'','action'=>'alert'),
                     JSON_UNESCAPED_UNICODE) . "\n";
                 @file_put_contents($lp, $e, FILE_APPEND);
                 $alerted[$file] = $h;
@@ -1844,7 +2277,7 @@ function pwaf_integrity_check(array $cfg) {
 }
 
 
-function pwaf_all_files($wr) {
+function pwaf_all_files($wr, $cfg = null) {
         $watch_ext = ['php','php3','php4','php5','php7','phtml','phar',
                   'ini','conf','config','cfg','htaccess','htpasswd',
                   'sh','bash','py','pl','rb','cgi',
@@ -1854,12 +2287,24 @@ function pwaf_all_files($wr) {
                   'env','key','pem','crt'];
     $files = [];
     $skip_dirs = ['.git', 'node_modules', 'vendor', '.svn'];
-    // Also skip the data directory (random hidden dir from .pwaf_ptr)
     $ptr = $wr . '/.pwaf_ptr';
     if (file_exists($ptr)) {
         $pdir = trim(file_get_contents($ptr));
         if ($pdir !== '') $skip_dirs[] = $pdir;
     }
+    if (is_array($cfg) && !empty($cfg['datadir'])) {
+        $skip_dirs[] = basename(rtrim(str_replace('\\', '/', $cfg['datadir']), '/'));
+    }
+    $listing = @scandir($wr);
+    if (is_array($listing)) {
+        foreach ($listing as $item) {
+            if ($item === '.' || $item === '..' || $item[0] !== '.') continue;
+            if (is_dir($wr . '/' . $item) && (file_exists($wr . '/' . $item . '/common.inc.php') || file_exists($wr . '/' . $item . '/.pwaf.php'))) {
+                $skip_dirs[] = $item;
+            }
+        }
+    }
+    $skip_dirs = array_values(array_unique($skip_dirs));
     try {
         $iter = new RecursiveIteratorIterator(
             new RecursiveDirectoryIterator($wr, RecursiveDirectoryIterator::SKIP_DOTS),
@@ -1871,9 +2316,12 @@ function pwaf_all_files($wr) {
             if ($base[0] === '.' && strpos($base, '.pwaf') === 0) continue;
             if ($base === 'waf.php') continue;
                         $path = $f->getRealPath();
+            if ($path === false) continue;
             $skip = false;
             foreach ($skip_dirs as $sd) {
-                if (strpos($path, DIRECTORY_SEPARATOR . $sd . DIRECTORY_SEPARATOR) !== false) { $skip = true; break; }
+                if ($sd === '') continue;
+                $needle = DIRECTORY_SEPARATOR . $sd . DIRECTORY_SEPARATOR;
+                if (strpos($path, $needle) !== false || substr($path, -strlen($sd)-1) === DIRECTORY_SEPARATOR . $sd) { $skip = true; break; }
             }
             if ($skip) continue;
                         if ($f->getSize() > 52428800) continue;
@@ -2006,6 +2454,10 @@ function pwaf_panel(array &$cfg, $ip) {
         switch ($act) {
             case 'toggle_waf':   $cfg['enabled'] = !$cfg['enabled']; pwaf_save_cfg($cfg); break;
             case 'toggle_autoban': $cfg['auto_ban'] = empty($cfg['auto_ban']); pwaf_save_cfg($cfg); break;
+            case 'toggle_checker':
+                $on = !isset($cfg['checker_detect']) || !empty($cfg['checker_detect']);
+                $cfg['checker_detect'] = !$on;
+                pwaf_save_cfg($cfg); break;
             case 'toggle_stealth': $cfg['stealth']  = empty($cfg['stealth']);  pwaf_save_cfg($cfg); break;
             case 'set_fpmode':
                 $m = (isset($GLOBALS['_PWAF_POST']['fp_mode']) ? $GLOBALS['_PWAF_POST']['fp_mode'] : 'balanced');
@@ -2044,6 +2496,7 @@ function pwaf_panel(array &$cfg, $ip) {
                     $x = $ri; $cfg['blacklist'] = array_values(array_filter($cfg['blacklist'], function($v) use ($x) { return $v !== $x; }));
                 } elseif ($lst === 'ck') {
                     $x = $ri; $cfg['checker_ips'] = array_values(array_filter($cfg['checker_ips'], function($v) use ($x) { return $v !== $x; }));
+                    if (isset($cfg['checker_grant'][$x])) unset($cfg['checker_grant'][$x]);
                 }
                 pwaf_save_cfg($cfg);
                 break;
@@ -2054,6 +2507,32 @@ function pwaf_panel(array &$cfg, $ip) {
             case 'clear_log': @file_put_contents($cfg['log'], ''); break;
             case 'export_csv': pwaf_export_csv($cfg); return;
             case 'update_baseline': pwaf_update_baseline($cfg); break;
+            case 'del_file':
+            case 'force_del_file':
+                $fp = trim((isset($GLOBALS['_PWAF_POST']['fpath']) ? $GLOBALS['_PWAF_POST']['fpath'] : ''));
+                $r = pwaf_integrity_delete($cfg, $fp, $act === 'force_del_file');
+                $_SESSION['pwaf_int_msg'] = $r[1];
+                break;
+            case 'force_del_new':
+                $lp = (isset($cfg['log']) ? $cfg['log'] : '');
+                $seen = array(); $n_ok = 0; $notes = array();
+                if (file_exists($lp)) {
+                    foreach (array_slice((array)@file($lp, FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES), -5000) as $line) {
+                        $ev = json_decode($line, true);
+                        if (!is_array($ev)) continue;
+                        $ru = (isset($ev['rule']) ? $ev['rule'] : '');
+                        if ($ru !== 'integrity_new' && $ru !== 'integrity_shell' && $ru !== 'watcher_shell') continue;
+                        $fp = (isset($ev['uri']) ? $ev['uri'] : '');
+                        if ($fp === '' || isset($seen[$fp])) continue;
+                        $seen[$fp] = 1;
+                        if (!file_exists($fp) && !is_link($fp)) continue;
+                        $r = pwaf_integrity_delete($cfg, $fp, true);
+                        $notes[] = $r[1];
+                        if (!empty($r[0])) $n_ok++;
+                    }
+                }
+                $_SESSION['pwaf_int_msg'] = '批量强力删除 ' . $n_ok . '/' . count($seen) . " 个新增/木马\n" . implode("\n", array_slice($notes, 0, 12));
+                break;
             case 'logout': session_destroy(); header('Location: '.$self); exit;
                         case 'add_custom_rule':
                 $rname = preg_replace('/[^a-z0-9_]/', '', strtolower(trim((isset($GLOBALS['_PWAF_POST']['rname']) ? $GLOBALS['_PWAF_POST']['rname'] : ''))));
@@ -2175,32 +2654,32 @@ function pwaf_panel(array &$cfg, $ip) {
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PhoenixWAF</title><style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0a0e1a;--card:#0f1629;--border:#1e2d4a;--accent:#f97316;--cyan:#38bdf8;--red:#f87171;--green:#4ade80;--muted:#4a5568;--text:#c9d1e0;--text2:#7a8ba0}
-body{background:var(--bg);color:var(--text);font-family:'Courier New',Consolas,monospace;font-size:14px;min-height:100vh;display:flex;flex-direction:column}
+:root{--bg:#f4f6fb;--card:#ffffff;--border:#e2e8f0;--accent:#ea580c;--cyan:#0369a1;--red:#dc2626;--green:#15803d;--muted:#94a3b8;--text:#1e293b;--text2:#64748b;--inset:#f8fafc;--code:#0f766e}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,-apple-system,sans-serif;font-size:14px;min-height:100vh;display:flex;flex-direction:column}
 /* scrollbar */
-::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:#1e2d4a;border-radius:3px}
+::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
 /* layout */
 .layout{display:flex;flex:1;overflow:hidden}
 /* sidebar */
 .sidebar{width:200px;min-width:200px;background:var(--card);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:0}
 .sidebar-logo{padding:20px 16px 14px;border-bottom:1px solid var(--border)}
-.sidebar-logo .logo-text{color:var(--accent);font-size:16px;font-weight:bold;letter-spacing:3px;text-shadow:0 0 20px rgba(249,115,22,.4)}
+.sidebar-logo .logo-text{color:var(--accent);font-size:16px;font-weight:bold;letter-spacing:3px}
 .sidebar-logo .logo-ver{color:var(--text2);font-size:10px;margin-top:3px}
 .nav-item{display:flex;align-items:center;gap:10px;padding:11px 16px;cursor:pointer;color:var(--text2);font-size:12px;letter-spacing:.5px;border-left:3px solid transparent;transition:all .2s;user-select:none}
-.nav-item:hover{color:var(--text);background:rgba(249,115,22,.06);border-left-color:rgba(249,115,22,.3)}
-.nav-item.active{color:var(--accent);background:rgba(249,115,22,.1);border-left-color:var(--accent)}
+.nav-item:hover{color:var(--text);background:rgba(234,88,12,.06);border-left-color:rgba(234,88,12,.35)}
+.nav-item.active{color:var(--accent);background:rgba(234,88,12,.08);border-left-color:var(--accent);font-weight:600}
 .nav-icon{font-size:14px;width:18px;text-align:center}
 .sidebar-footer{margin-top:auto;padding:14px 16px;border-top:1px solid var(--border)}
 /* topbar */
-.topbar{background:var(--card);border-bottom:1px solid var(--border);padding:10px 24px;display:flex;align-items:center;gap:14px;flex-shrink:0}
-.topbar-title{color:var(--accent);font-size:15px;font-weight:bold;letter-spacing:2px;text-shadow:0 0 16px rgba(249,115,22,.35)}
+.topbar{background:var(--card);border-bottom:1px solid var(--border);padding:10px 24px;display:flex;align-items:center;gap:14px;flex-shrink:0;box-shadow:0 1px 0 rgba(15,23,42,.04)}
+.topbar-title{color:var(--accent);font-size:15px;font-weight:bold;letter-spacing:2px}
 .topbar-spacer{flex:1}
 .topbar-info{display:flex;align-items:center;gap:16px;color:var(--text2);font-size:11px}
 .status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:5px;flex-shrink:0}
-.status-dot.on{background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse-green 2s infinite}
-.status-dot.off{background:var(--red);box-shadow:0 0 8px var(--red);animation:pulse-red 2s infinite}
-@keyframes pulse-green{0%,100%{box-shadow:0 0 4px var(--green)}50%{box-shadow:0 0 12px var(--green),0 0 20px rgba(74,222,128,.3)}}
-@keyframes pulse-red{0%,100%{box-shadow:0 0 4px var(--red)}50%{box-shadow:0 0 12px var(--red),0 0 20px rgba(248,113,113,.3)}}
+.status-dot.on{background:var(--green);box-shadow:0 0 0 3px rgba(21,128,61,.18)}
+.status-dot.off{background:var(--red);box-shadow:0 0 0 3px rgba(220,38,38,.18)}
+@keyframes pulse-green{0%,100%{box-shadow:0 0 0 3px rgba(21,128,61,.12)}50%{box-shadow:0 0 0 5px rgba(21,128,61,.22)}}
+@keyframes pulse-red{0%,100%{box-shadow:0 0 0 3px rgba(220,38,38,.12)}50%{box-shadow:0 0 0 5px rgba(220,38,38,.22)}}
 /* main content */
 .main{flex:1;overflow-y:auto;padding:20px 24px}
 /* tabs */
@@ -2208,52 +2687,51 @@ body{background:var(--bg);color:var(--text);font-family:'Courier New',Consolas,m
 @keyframes tabfade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 /* stat cards */
 .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:20px}
-.stat-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px 18px;position:relative;overflow:hidden;transition:transform .2s,box-shadow .2s}
-.stat-card:hover{transform:translateY(-2px)}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px 18px;position:relative;overflow:hidden;transition:transform .2s,box-shadow .2s;box-shadow:0 1px 2px rgba(15,23,42,.04)}
+.stat-card:hover{transform:translateY(-2px);box-shadow:0 8px 20px rgba(15,23,42,.08)}
 .stat-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:8px 0 0 8px}
-.stat-card.c-orange::before{background:var(--accent);box-shadow:0 0 12px rgba(249,115,22,.5)}
-.stat-card.c-red::before{background:var(--red);box-shadow:0 0 12px rgba(248,113,113,.5)}
-.stat-card.c-cyan::before{background:var(--cyan);box-shadow:0 0 12px rgba(56,189,248,.5)}
-.stat-card.c-green::before{background:var(--green);box-shadow:0 0 12px rgba(74,222,128,.5)}
+.stat-card.c-orange::before{background:var(--accent)}
+.stat-card.c-red::before{background:var(--red)}
+.stat-card.c-cyan::before{background:var(--cyan)}
+.stat-card.c-green::before{background:var(--green)}
 .stat-card.c-alert::before{background:var(--red)}
 .stat-label{color:var(--text2);font-size:10px;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px}
 .stat-val{font-size:28px;font-weight:bold;line-height:1}
-.stat-val.orange{color:var(--accent);text-shadow:0 0 20px rgba(249,115,22,.3)}
-.stat-val.red{color:var(--red);text-shadow:0 0 20px rgba(248,113,113,.3)}
-.stat-val.cyan{color:var(--cyan);text-shadow:0 0 20px rgba(56,189,248,.3)}
+.stat-val.orange{color:var(--accent)}
+.stat-val.red{color:var(--red)}
+.stat-val.cyan{color:var(--cyan)}
 /* section */
-.sec{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px}
+.sec{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px;box-shadow:0 1px 2px rgba(15,23,42,.04)}
 .sec-title{color:var(--accent);font-size:11px;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
-.sec-title::before{content:'';width:3px;height:12px;background:var(--accent);border-radius:2px;box-shadow:0 0 8px rgba(249,115,22,.5)}
+.sec-title::before{content:'';width:3px;height:12px;background:var(--accent);border-radius:2px}
 /* controls bar */
 .ctrl-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 /* buttons */
 .btn{display:inline-flex;align-items:center;gap:5px;padding:6px 12px;border-radius:5px;border:none;cursor:pointer;font-size:11px;font-family:inherit;font-weight:bold;letter-spacing:.5px;transition:all .2s;white-space:nowrap}
-.btn:hover{filter:brightness(1.15);transform:translateY(-1px)}
+.btn:hover{filter:brightness(1.05);transform:translateY(-1px)}
 .btn:active{transform:translateY(0)}
-/* 键盘可达性：为按钮/输入/下拉/导航提供清晰的焦点环 */
 .btn:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,.nav-item:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .nav-item:focus-visible{outline-offset:-2px}
-.bo{background:var(--accent);color:#000}.br{background:#dc2626;color:#fff}.bg{background:#16a34a;color:#fff}.bs{background:#1e2d4a;color:var(--text);border:1px solid var(--border)}
+.bo{background:var(--accent);color:#fff}.br{background:#dc2626;color:#fff}.bg{background:#16a34a;color:#fff}.bs{background:#fff;color:var(--text);border:1px solid var(--border)}
 /* inputs */
-input[type=text],input[type=password]{background:#060a14;border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:5px;font-family:inherit;font-size:12px;transition:border-color .2s,box-shadow .2s;outline:none}
-input[type=text]:focus,input[type=password]:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(249,115,22,.15)}
+input[type=text],input[type=password],select{background:var(--inset);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:5px;font-family:inherit;font-size:12px;transition:border-color .2s,box-shadow .2s;outline:none}
+input[type=text]:focus,input[type=password]:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(234,88,12,.12);background:#fff}
 /* rule badges */
-.b{display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:bold;background:#1e2d4a;color:#fff;letter-spacing:.3px}
-.b-sqli{background:#5b21b6}.b-cmdi{background:#991b1b}.b-lfi{background:#92400e}.b-xss{background:#0e7490}
-.b-code{background:#9d174d}.b-ssrf{background:#064e3b}.b-xxe{background:#1e3a8a}.b-unserialize{background:#78350f}
-.b-upload{background:#7f1d1d}.b-flag_leak,.b-flag_leak_b64,.b-flag_leak_hex{background:#d97706;color:#000}
-.b-honeypot{background:#065f46;color:#6ee7b7}.b-blacklist,.b-rate_limit{background:#374151}
-.b-shell_output{background:#b91c1c}.b-checker_whitelist{background:#14532d;color:#86efac}
-.b-integrity_new,.b-integrity_modified{background:#991b1b}
+.b{display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:bold;background:#475569;color:#fff;letter-spacing:.3px}
+.b-sqli{background:#6d28d9}.b-cmdi{background:#b91c1c}.b-lfi{background:#b45309}.b-xss{background:#0e7490}
+.b-code{background:#be185d}.b-ssrf{background:#047857}.b-xxe{background:#1d4ed8}.b-unserialize{background:#a16207}
+.b-upload{background:#991b1b}.b-flag_leak,.b-flag_leak_b64,.b-flag_leak_hex{background:#d97706;color:#fff}
+.b-honeypot{background:#047857;color:#fff}.b-blacklist,.b-rate_limit{background:#475569}
+.b-shell_output{background:#b91c1c}.b-checker_whitelist{background:#166534;color:#fff}
+.b-integrity_new,.b-integrity_modified{background:#b91c1c}
 /* toggle switch */
 .toggle-wrap{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--border)}
 .toggle-wrap:last-child{border-bottom:none}
 .toggle-switch{position:relative;display:inline-block;width:40px;height:22px;flex-shrink:0;vertical-align:middle}
 .toggle-switch input{opacity:0;width:0;height:0;position:absolute}
-.toggle-slider{position:absolute;inset:0;background:#1e2d4a;border-radius:22px;cursor:pointer;transition:background .25s,box-shadow .25s;border:1px solid var(--border)}
-.toggle-slider::after{content:'';position:absolute;width:16px;height:16px;left:2px;top:2px;background:#4a5568;border-radius:50%;transition:transform .25s,background .25s}
-.toggle-switch input:checked + .toggle-slider{background:rgba(74,222,128,.15);border-color:#16a34a;box-shadow:0 0 8px rgba(74,222,128,.2)}
+.toggle-slider{position:absolute;inset:0;background:#e2e8f0;border-radius:22px;cursor:pointer;transition:background .25s,box-shadow .25s;border:1px solid var(--border)}
+.toggle-slider::after{content:'';position:absolute;width:16px;height:16px;left:2px;top:2px;background:#fff;border-radius:50%;transition:transform .25s,background .25s;box-shadow:0 1px 2px rgba(15,23,42,.2)}
+.toggle-switch input:checked + .toggle-slider{background:#bbf7d0;border-color:#16a34a}
 .toggle-switch input:checked + .toggle-slider::after{transform:translateX(18px);background:var(--green)}
 /* rule row layout */
 .rule-row{border-bottom:1px solid var(--border);padding:10px 0}
@@ -2262,23 +2740,23 @@ input[type=text]:focus,input[type=password]:focus{border-color:var(--accent);box
 .rule-info{display:flex;align-items:center;gap:10px;flex:1;min-width:0;overflow:hidden}
 .rule-toggle-form{flex-shrink:0;margin-left:auto;padding-left:16px;display:flex;align-items:center;height:22px}
 /* IP tags */
-.iptag{display:inline-flex;align-items:center;gap:4px;background:#0d1526;border:1px solid var(--border);padding:3px 8px;border-radius:4px;margin:2px;font-size:11px;transition:border-color .2s}
+.iptag{display:inline-flex;align-items:center;gap:4px;background:var(--inset);border:1px solid var(--border);padding:3px 8px;border-radius:4px;margin:2px;font-size:11px;transition:border-color .2s}
 .iptag:hover{border-color:var(--accent)}
-.iptag button{background:none;border:none;color:#f87171;cursor:pointer;font-size:13px;line-height:1;padding:0;transition:color .2s}
-.iptag button:hover{color:#fff}
+.iptag button{background:none;border:none;color:var(--red);cursor:pointer;font-size:13px;line-height:1;padding:0;transition:color .2s}
+.iptag button:hover{color:#991b1b}
 /* table */
 table{width:100%;border-collapse:collapse}
 th{text-align:left;color:var(--text2);font-size:11px;text-transform:uppercase;letter-spacing:1px;padding:6px 8px;border-bottom:1px solid var(--border)}
-td{padding:6px 8px;border-bottom:1px solid rgba(30,45,74,.5);font-size:12px;word-break:break-all;transition:background .15s}
-tr:hover td{background:rgba(249,115,22,.04)}
+td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px;word-break:break-all;transition:background .15s}
+tr:hover td{background:rgba(234,88,12,.04)}
 /* log search */
 .log-search{margin-bottom:10px}
 .log-search input{width:100%;max-width:400px;padding:7px 12px;font-size:13px}
 /* textarea */
-textarea{background:#060a14;border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:5px;font-family:'Courier New',Consolas,monospace;font-size:12px;resize:vertical;outline:none;transition:border-color .2s,box-shadow .2s;width:100%}
-textarea:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(249,115,22,.15)}
+textarea{background:var(--inset);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:5px;font-family:Consolas,'Courier New',monospace;font-size:12px;resize:vertical;outline:none;transition:border-color .2s,box-shadow .2s;width:100%}
+textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(234,88,12,.12);background:#fff}
 /* rule detail expand */
-.rule-detail{display:none;background:#060a14;border:1px solid var(--border);border-radius:5px;padding:10px;margin-top:8px;font-size:11px;color:#7dd3fc;line-height:1.7}
+.rule-detail{display:none;background:var(--inset);border:1px solid var(--border);border-radius:5px;padding:10px;margin-top:8px;font-size:11px;color:var(--code);line-height:1.7}
 .rule-detail.open{display:block}
 .rule-expand-btn{background:none;border:none;color:var(--text2);cursor:pointer;font-size:11px;padding:0;font-family:inherit;transition:color .2s}
 .rule-expand-btn:hover{color:var(--accent)}
@@ -2287,29 +2765,25 @@ textarea:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(249,115,22,.
 .three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
 @media(max-width:1100px){.three{grid-template-columns:1fr 1fr}}
 @media(max-width:750px){.two,.three{grid-template-columns:1fr}.layout{flex-direction:column}
-/* 移动端：侧栏改为顶部横向可滚动导航条，而非隐藏（否则手机上锁死在单一 Tab 无法切换）*/
 .sidebar{width:100%;min-width:0;flex-direction:row;overflow-x:auto;border-right:none;border-bottom:1px solid var(--border)}
 .sidebar-logo,.sidebar-footer{display:none}
 .nav-item{white-space:nowrap;border-left:none;border-bottom:3px solid transparent;padding:12px 14px}
 .nav-item.active{border-left:none;border-bottom-color:var(--accent)}
-/* 内联多列表单在窄屏折叠为单列 */
 .fp-modes{grid-template-columns:1fr}}
-/* v3.8 badges for new rules + leak types */
-.b-nosqli{background:#3730a3}.b-ssti{background:#7c2d12}.b-jwt{background:#155e75}.b-proto{background:#4a044e}
-.b-flag_leak_url,.b-flag_leak_entity,.b-flag_leak_reverse{background:#d97706;color:#000}
-[class*="b-"][class$="_score"]{background:#a16207;color:#000}
-/* v3.8 stat card subtle gradient */
-.stat-card{background:linear-gradient(135deg,var(--card) 0%,#0c1322 100%)}
-.stat-card::after{content:'';position:absolute;right:-20px;top:-20px;width:70px;height:70px;border-radius:50%;background:radial-gradient(circle,rgba(249,115,22,.06),transparent 70%);pointer-events:none}
-/* v3.8 protection-strength mode selector */
+.b-nosqli{background:#4338ca}.b-ssti{background:#c2410c}.b-jwt{background:#0e7490}.b-proto{background:#7e22ce}
+.b-flag_leak_url,.b-flag_leak_entity,.b-flag_leak_reverse{background:#d97706;color:#fff}
+[class*="b-"][class$="_score"]{background:#a16207;color:#fff}
+.stat-card{background:linear-gradient(180deg,var(--card) 0%,#fbfdff 100%)}
+.stat-card::after{content:'';position:absolute;right:-20px;top:-20px;width:70px;height:70px;border-radius:50%;background:radial-gradient(circle,rgba(234,88,12,.08),transparent 70%);pointer-events:none}
 .fp-modes{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
 .fp-mode-form{display:flex}
-.fp-mode-btn{width:100%;text-align:left;display:flex;flex-direction:column;gap:6px;background:#0b1120;border:1px solid var(--border);border-radius:8px;padding:12px 14px;cursor:pointer;font-family:inherit;transition:all .2s;position:relative;overflow:hidden}
-.fp-mode-btn:hover{border-color:var(--accent);transform:translateY(-2px);box-shadow:0 4px 14px rgba(0,0,0,.3)}
-.fp-mode-btn.active{border-color:var(--fpc,var(--accent));background:linear-gradient(135deg,rgba(249,115,22,.08),transparent);box-shadow:0 0 0 1px var(--fpc,var(--accent)) inset,0 0 16px rgba(249,115,22,.12)}
+.fp-mode-btn{width:100%;text-align:left;display:flex;flex-direction:column;gap:6px;background:var(--inset);border:1px solid var(--border);border-radius:8px;padding:12px 14px;cursor:pointer;font-family:inherit;transition:all .2s;position:relative;overflow:hidden}
+.fp-mode-btn:hover{border-color:var(--accent);transform:translateY(-2px);box-shadow:0 4px 14px rgba(15,23,42,.08)}
+.fp-mode-btn.active{border-color:var(--fpc,var(--accent));background:linear-gradient(135deg,rgba(234,88,12,.08),#fff);box-shadow:0 0 0 1px var(--fpc,var(--accent)) inset}
 .fp-mode-btn.active::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--fpc,var(--accent))}
 .fp-mode-name{color:var(--text);font-size:14px;font-weight:bold;letter-spacing:1px}
 .fp-mode-desc{color:var(--text2);font-size:11px;line-height:1.6}
+code,pre{font-family:Consolas,'Courier New',monospace}
 </style></head><body>
 <!-- topbar -->
 <div class="topbar">
@@ -2359,8 +2833,9 @@ $fpm_color = ['balanced'=>'var(--green)','strict'=>'var(--accent)','paranoid'=>'
 <div class="sec"><div class="sec-title">快捷操作</div>
 <div class="ctrl-bar">
 <form method="post" action="<?= $e($self) ?>"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="toggle_waf"><button type="submit" class="btn <?= $on ? 'br' : 'bg' ?>"><?= $on ? '&#x25A0; 停用 WAF' : '&#x25B6; 启用 WAF' ?></button></form>
-<form method="post" action="<?= $e($self) ?>"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="toggle_autoban"><button type="submit" class="btn <?= !empty($cfg['auto_ban']) ? 'br' : 'bs' ?>" title="自动拉黑攻击 IP（默认关闭，防止误封裁判机）">自动拉黑: <?= !empty($cfg['auto_ban']) ? '<span style="color:#4ade80">开</span>' : '<span style="color:#f87171">关</span>' ?></button></form>
-<form method="post" action="<?= $e($self) ?>"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="toggle_stealth"><button type="submit" class="btn bs" title="隐身模式：拦截时返回假 200，迷惑攻击者">隐身模式: <?= !empty($cfg['stealth']) ? '<span style="color:#4ade80">开</span>' : '<span style="color:#f87171">关</span>' ?></button></form>
+<form method="post" action="<?= $e($self) ?>"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="toggle_autoban"><button type="submit" class="btn <?= !empty($cfg['auto_ban']) ? 'br' : 'bs' ?>" title="自动拉黑攻击 IP（默认关闭，防止误封裁判机）">自动拉黑: <?= !empty($cfg['auto_ban']) ? '<span style="color:var(--green)">开</span>' : '<span style="color:var(--red)">关</span>' ?></button></form>
+<form method="post" action="<?= $e($self) ?>"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="toggle_checker"><button type="submit" class="btn <?= (!isset($cfg['checker_detect']) || !empty($cfg['checker_detect'])) ? 'bg' : 'bs' ?>" title="空刷 / 满 3 次才加白；被拦过的 IP 永不加白；加白有过期。误加白会让该 IP 绕过普通扫描（上传仍拦）">裁判机识别: <?= (!isset($cfg['checker_detect']) || !empty($cfg['checker_detect'])) ? '<span style="color:#fff">开</span>' : '<span style="color:var(--red)">关</span>' ?></button></form>
+<form method="post" action="<?= $e($self) ?>"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="toggle_stealth"><button type="submit" class="btn bs" title="隐身模式：拦截时返回假 200，迷惑攻击者">隐身模式: <?= !empty($cfg['stealth']) ? '<span style="color:var(--green)">开</span>' : '<span style="color:var(--red)">关</span>' ?></button></form>
 <form method="post" action="<?= $e($self) ?>" style="display:flex;gap:6px;align-items:center"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="fake_flag"><input type="text" name="ff" value="<?= $e($cfg['fake_flag']) ?>" style="width:220px" placeholder="假 flag 内容"><button type="submit" class="btn bo">设置假 Flag</button></form>
 <form method="post" action="<?= $e($self) ?>"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="update_baseline"><button type="submit" class="btn bs" onclick="return confirm('更新文件完整性基线？')">更新基线</button></form>
 <form method="post" action="<?= $e($self) ?>"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="export_csv"><button type="submit" class="btn bs">导出 CSV</button></form>
@@ -2390,7 +2865,7 @@ $fp_meta = [
 <?php endforeach; ?>
 </div>
 <div class="ctrl-bar" style="margin-top:12px">
-  <form method="post" action="<?= $e($self) ?>"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="toggle_static"><button type="submit" class="btn <?= !empty($cfg['static_bypass']) ? 'bg' : 'bs' ?>" title="对 css/js/图片/字体等静态资源快速放行，杜绝误报并提速">静态资源放行: <?= !empty($cfg['static_bypass']) ? '<span style="color:#4ade80">开</span>' : '<span style="color:#f87171">关</span>' ?></button></form>
+  <form method="post" action="<?= $e($self) ?>"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="toggle_static"><button type="submit" class="btn <?= !empty($cfg['static_bypass']) ? 'bg' : 'bs' ?>" title="对 css/js/图片/字体等静态资源快速放行，杜绝误报并提速">静态资源放行: <?= !empty($cfg['static_bypass']) ? '<span style="color:var(--green)">开</span>' : '<span style="color:var(--red)">关</span>' ?></button></form>
   <span style="color:var(--text2);font-size:11px;align-self:center">当前评分阈值: <b style="color:var(--cyan)"><?= (int)(isset($cfg['score_threshold']) ? $cfg['score_threshold'] : 2) ?></b> 次低置信命中 → 拦截</span>
 </div>
 </div>
@@ -2505,8 +2980,8 @@ $rule_info = [
   </div>
   <div id="rd-<?= $e($r) ?>" class="rule-detail">
     <div style="color:var(--text);margin-bottom:8px;line-height:1.8;font-size:12px"><?= $e($info[1]) ?></div>
-    <div style="color:#fbbf24;font-size:10px;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px">示例 Payload：</div>
-    <pre style="color:#7dd3fc;font-size:11px;white-space:pre-wrap;background:#030712;padding:8px;border-radius:4px;border:1px solid var(--border)"><?= $e($info[2]) ?></pre>
+    <div style="color:var(--accent);font-size:10px;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px">示例 Payload：</div>
+    <pre style="color:var(--code);font-size:11px;white-space:pre-wrap;background:var(--inset);padding:8px;border-radius:4px;border:1px solid var(--border)"><?= $e($info[2]) ?></pre>
   </div>
 </div><?php endforeach; ?>
 </div>
@@ -2516,8 +2991,8 @@ $rule_info = [
 <?php foreach ($cfg['custom_rules'] as $rname => $rcfg): ?>
 <div class="toggle-wrap">
   <div style="display:flex;align-items:center;gap:8px;flex:1">
-    <span class="b" style="background:#1e3a5f"><?= $e($rname) ?></span>
-    <code style="color:#7dd3fc;font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?= $e($rcfg['pat']) ?></code>
+    <span class="b" style="background:#1d4ed8"><?= $e($rname) ?></span>
+    <code style="color:var(--code);font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?= $e($rcfg['pat']) ?></code>
     <span style="color:var(--text2);font-size:10px">范围: <?= $e((isset($rcfg['scope']) ? $rcfg['scope'] : 'all')) ?></span>
   </div>
   <div style="display:flex;gap:6px;align-items:center">
@@ -2558,7 +3033,7 @@ $rule_info = [
     </div>
     <div>
       <div style="color:var(--text2);font-size:10px;margin-bottom:4px">检测范围</div>
-      <select name="rscope" style="background:#060a14;border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:5px;font-family:inherit;font-size:12px;width:100%">
+      <select name="rscope" style="background:var(--inset);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:5px;font-family:inherit;font-size:12px;width:100%">
         <option value="all">全部输入</option>
         <option value="GET">GET 参数</option>
         <option value="POST">POST 参数</option>
@@ -2594,9 +3069,10 @@ $rule_info = [
 </div>
 </div>
 
-<div class="sec"><div class="sec-title" style="color:#fbbf24">裁判机 IP <span style="color:var(--text2);font-weight:normal;font-size:10px">（自动识别）</span></div>
+<div class="sec"><div class="sec-title" style="color:#ca8a04">裁判机 IP <span style="color:var(--text2);font-weight:normal;font-size:10px">（扫描放行后才计数，被拦过永不加白，<?= (int)(isset($cfg['checker_ttl']) ? $cfg['checker_ttl'] : 1800) ?>s 过期）</span></div>
+<div style="color:var(--text2);font-size:11px;margin-bottom:8px">自动识别: <?= (!isset($cfg['checker_detect']) || !empty($cfg['checker_detect'])) ? '<span style="color:var(--green)">开</span>' : '<span style="color:var(--red)">关</span>' ?> · 点标签 × 可立即踢出</div>
 <div style="line-height:1.8">
-<?php foreach ($cfg['checker_ips'] as $ci): ?><span class="iptag" style="border-color:#1e3a1e;background:#0a1a0a"><?= $e($ci) ?><form method="post" action="<?= $e($self) ?>" style="display:inline"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="rm_ip"><input type="hidden" name="list" value="ck"><input type="hidden" name="ip" value="<?= $e($ci) ?>"><button type="submit">&#xD7;</button></form></span><?php endforeach; ?>
+<?php foreach ($cfg['checker_ips'] as $ci): ?><span class="iptag" style="border-color:#86efac;background:#f0fdf4"><?= $e($ci) ?><form method="post" action="<?= $e($self) ?>" style="display:inline"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="rm_ip"><input type="hidden" name="list" value="ck"><input type="hidden" name="ip" value="<?= $e($ci) ?>"><button type="submit">&#xD7;</button></form></span><?php endforeach; ?>
 </div>
 </div>
 </div>
@@ -2616,9 +3092,9 @@ $rule_info = [
 <td><?= $e((isset($ev['method']) ? $ev['method'] : '')) ?></td>
 <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="<?= $e(isset($ev['uri']) ? $ev['uri'] : '') ?>"><?= $e((isset($ev['uri']) ? $ev['uri'] : '')) ?></td>
 <td><?= $e((isset($ev['param']) ? $ev['param'] : '')) ?></td>
-<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fbbf24" title="<?= $e(isset($ev['payload']) ? $ev['payload'] : '') ?>"><?= $e((isset($ev['payload']) ? $ev['payload'] : '')) ?></td>
+<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--accent)" title="<?= $e(isset($ev['payload']) ? $ev['payload'] : '') ?>"><?= $e((isset($ev['payload']) ? $ev['payload'] : '')) ?></td>
 <td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)" title="<?= $e(isset($ev['referer']) ? $ev['referer'] : '') ?>"><?= $e((isset($ev['referer']) ? $ev['referer'] : '-')) ?></td>
-<td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#7dd3fc" title="<?= $e(isset($ev['post']) ? $ev['post'] : '') ?>"><?= $e((isset($ev['post']) ? $ev['post'] : '-')) ?></td>
+<td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--code)" title="<?= $e(isset($ev['post']) ? $ev['post'] : '') ?>"><?= $e((isset($ev['post']) ? $ev['post'] : '-')) ?></td>
 <td style="color:var(--text2)"><?= isset($ev['ms']) ? $ev['ms'] : '-' ?></td>
 </tr><?php endforeach; ?>
 </table></div></div>
@@ -2630,12 +3106,12 @@ $rule_info = [
 <div style="color:var(--text2);font-size:12px;margin-bottom:14px;line-height:1.8">
 将每个请求异步镜像转发到指定目标，不影响主请求响应速度。<br>
 支持 IP 段过滤：只转发来自特定 IP 段的请求（可用于只转发攻击者流量）。<br>
-<span style="color:#fbbf24">格式：每行一个目标，格式为 <code style="background:#1e2d4a;padding:1px 5px;border-radius:3px">主机[:端口] [IP段]</code></span><br>
+<span style="color:var(--accent)">格式：每行一个目标，格式为 <code style="background:var(--inset);padding:1px 5px;border-radius:3px;border:1px solid var(--border)">主机[:端口] [IP段]</code></span><br>
 <span style="color:var(--text2);font-size:11px">
 示例：<br>
-<code style="color:#7dd3fc">192.168.1.100</code> — 转发到 192.168.1.100:80，不限来源<br>
-<code style="color:#7dd3fc">10.0.0.5:8080 192.168.12.0/24</code> — 转发到 8080 端口，且只转发特定 IP 段的请求<br>
-<code style="color:#7dd3fc">honeypot.local:80 10.10.1.1-10.10.2.255</code> — IP 范围格式<br>
+<code style="color:var(--code)">192.168.1.100</code> — 转发到 192.168.1.100:80，不限来源<br>
+<code style="color:var(--code)">10.0.0.5:8080 192.168.12.0/24</code> — 转发到 8080 端口，且只转发特定 IP 段的请求<br>
+<code style="color:var(--code)">honeypot.local:80 10.10.1.1-10.10.2.255</code> — IP 范围格式<br>
 <code style="color:#f97316">192.168.1.1:8801-8820</code> — 批量转发到同一 IP 的多个端口（切勿设置过大范围，以免阻塞 PHP 进程）
 </span>
 </div>
@@ -2686,7 +3162,12 @@ if (file_exists($lp_int)) {
     }
 }
 $int_events = array_reverse(array_slice($int_events, -200));
+$int_op_msg = isset($_SESSION['pwaf_int_msg']) ? $_SESSION['pwaf_int_msg'] : '';
+unset($_SESSION['pwaf_int_msg']);
 ?>
+<?php if ($int_op_msg !== ''): ?>
+<div class="sec" style="border-color:var(--accent);background:var(--inset)"><div style="color:var(--text);font-size:12px;white-space:pre-wrap;line-height:1.7"><?= $e($int_op_msg) ?></div></div>
+<?php endif; ?>
 <div class="stats-grid" style="margin-bottom:16px">
   <div class="stat-card <?= count($int_events) > 0 ? 'c-alert' : 'c-green' ?>">
     <div class="stat-label">完整性告警</div>
@@ -2709,30 +3190,57 @@ $int_events = array_reverse(array_slice($int_events, -200));
   <input type="hidden" name="act" value="update_baseline">
   <button type="submit" class="btn bo" onclick="return confirm('更新基线将以当前文件状态为准，确认？')">&#x21BB; 更新基线</button>
 </form>
+<form method="post" action="<?= $e($self) ?>" onsubmit="return confirm('对告警里仍存在的新增文件/木马全部强力删除？\n会 chattr 解锁、杀掉占文件进程、删除后用同名目录+chattr +i 占坑，防止不死马写回。\n不会动基线里的业务文件。');">
+  <input type="hidden" name="waf_key" value="<?= $e($key) ?>">
+  <input type="hidden" name="act" value="force_del_new">
+  <button type="submit" class="btn br">强力清除全部新增/木马</button>
+</form>
 <div style="color:var(--text2);font-size:11px;line-height:1.7">
   基线记录所有 PHP/配置/脚本/数据库文件的 SHA256 哈希。<br>
-  每 5 秒自动检查一次，发现新增或篡改文件时记录告警。<br>
-  <span style="color:#fbbf24">监控范围：.php .ini .conf .sh .py .sql .xml .env .key .pem 等</span>
+  每 5 秒自动检查一次；新增 PHP 木马会告警并改成 exit。<br>
+  <b>删除</b>：unlink。 <b>强力删除</b>（Linux）：chattr -ia、杀占文件进程、rm，再用同名目录 + chattr +i 占坑防不死马写回。<br>
+  <span style="color:#ca8a04">监控范围：.php .ini .conf .sh .py .sql .xml .env .key .pem 等</span>
 </div>
 </div></div>
 
 <?php if (!empty($int_events)): ?>
 <div class="sec"><div class="sec-title" style="color:var(--red)">告警记录 <span style="color:var(--text2);font-weight:normal;font-size:10px">（最近 200 条）</span></div>
 <div style="overflow-x:auto"><table>
-<tr><th>时间</th><th>类型</th><th>文件路径</th><th>SHA256</th></tr>
+<tr><th>时间</th><th>类型</th><th>文件路径</th><th>状态</th><th>操作</th></tr>
 <?php foreach ($int_events as $ev):
     $rule = (isset($ev['rule']) ? $ev['rule'] : '');
-    $color = $rule === 'integrity_new' ? '#f97316' : (strpos($rule, 'watcher_') === 0 ? '#f87171' : '#fbbf24');
-    $labels = ['integrity_new'=>'新增文件','integrity_modified'=>'文件篡改',
+    $color = $rule === 'integrity_new' ? '#ea580c' : ((strpos($rule, 'watcher_') === 0 || $rule === 'integrity_shell' || $rule === 'integrity_force_del') ? '#dc2626' : '#ca8a04');
+    $labels = ['integrity_new'=>'新增文件','integrity_modified'=>'文件篡改','integrity_shell'=>'木马查杀',
+               'integrity_del'=>'已删除','integrity_force_del'=>'强力删除',
                'watcher_shell'=>'不死马查杀','watcher_restore'=>'文件恢复',
                'watcher_tamper'=>'篡改恢复','watcher_deleted'=>'文件删除'];
     $label = (isset($labels[$rule]) ? $labels[$rule] : $rule);
+    $fp = (isset($ev['uri']) ? $ev['uri'] : '');
+    $st = !is_file($fp) && !is_dir($fp) && !is_link($fp) ? 'gone' : (is_dir($fp) ? 'dir' : 'file');
+    $st_l = $st === 'gone' ? '<span style="color:var(--green)">已不在</span>' : ($st === 'dir' ? '<span style="color:var(--accent)">占坑目录</span>' : '<span style="color:var(--red)">仍存在</span>');
+    $can = ($fp !== '' && $st !== 'gone' && ($rule === 'integrity_new' || $rule === 'integrity_shell' || $rule === 'integrity_modified' || $rule === 'watcher_shell' || $rule === 'integrity_force_del'));
 ?>
 <tr>
   <td style="white-space:nowrap"><?= $e((isset($ev['dt']) ? $ev['dt'] : date('Y-m-d H:i:s', (isset($ev['ts']) ? $ev['ts'] : 0)))) ?></td>
-  <td><span class="b" style="background:<?= $color ?>;color:#000"><?= $e($label) ?></span></td>
-  <td style="color:#7dd3fc;word-break:break-all;max-width:400px"><?= $e((isset($ev['uri']) ? $ev['uri'] : '')) ?></td>
-  <td style="color:var(--text2);font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="<?= $e(isset($ev['payload']) ? $ev['payload'] : '') ?>"><?= $e(substr((isset($ev['payload']) ? $ev['payload'] : ''),0,16)) ?>...</td>
+  <td><span class="b" style="background:<?= $color ?>;color:#fff"><?= $e($label) ?></span></td>
+  <td style="color:var(--code);word-break:break-all;max-width:360px"><?= $e($fp) ?></td>
+  <td style="white-space:nowrap;font-size:11px"><?= $st_l ?></td>
+  <td style="white-space:nowrap">
+    <?php if ($can): ?>
+    <form method="post" action="<?= $e($self) ?>" style="display:inline" onsubmit="return confirm('删除该文件？');">
+      <input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="del_file">
+      <input type="hidden" name="fpath" value="<?= $e($fp) ?>">
+      <button type="submit" class="btn bs" style="padding:2px 8px;font-size:10px">删除</button>
+    </form>
+    <form method="post" action="<?= $e($self) ?>" style="display:inline" onsubmit="return confirm('强力删除：解锁 chattr、杀占文件进程、删除后占坑防不死马写回？');">
+      <input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="force_del_file">
+      <input type="hidden" name="fpath" value="<?= $e($fp) ?>">
+      <button type="submit" class="btn br" style="padding:2px 8px;font-size:10px">强力删除</button>
+    </form>
+    <?php else: ?>
+    <span style="color:var(--text2);font-size:10px">—</span>
+    <?php endif; ?>
+  </td>
 </tr>
 <?php endforeach; ?>
 </table></div></div>
@@ -2746,7 +3254,7 @@ $int_events = array_reverse(array_slice($int_events, -200));
 <table><tr><th>文件路径</th><th>SHA256</th></tr>
 <?php foreach ($int_base as $fp => $fh): ?>
 <tr>
-  <td style="color:#7dd3fc;font-size:11px"><?= $e($fp) ?></td>
+  <td style="color:var(--code);font-size:11px"><?= $e($fp) ?></td>
   <td style="color:var(--text2);font-size:10px"><?= $e(substr($fh,0,16)) ?>...</td>
 </tr>
 <?php endforeach; ?>
@@ -2759,7 +3267,7 @@ $int_events = array_reverse(array_slice($int_events, -200));
 <div class="sec"><div class="sec-title">自动提交 Flag</div>
 <div style="color:var(--text2);font-size:12px;margin-bottom:14px;line-height:1.7">
 当 WAF 的响应 Hook 捕获到 flag 时，自动向平台提交。<br>
-在下方粘贴从 Burp Suite / Yakit 截获的提交数据包，将 flag 值替换为 <code style="color:#f97316;background:#1e2d4a;padding:1px 5px;border-radius:3px">${flag}</code>。
+在下方粘贴从 Burp Suite / Yakit 截获的提交数据包，将 flag 值替换为 <code style="color:var(--accent);background:var(--inset);padding:1px 5px;border-radius:3px;border:1px solid var(--border)">${flag}</code>。
 </div>
 <form method="post" action="<?= $e($self) ?>">
   <input type="hidden" name="waf_key" value="<?= $e($key) ?>">
@@ -2815,7 +3323,7 @@ if (file_exists($fl)):
     <div class="sec-title">流量重放 / 广播攻击</div>
     <div style="color:var(--text2);font-size:12px;margin-bottom:14px;line-height:1.8">
       将捕获的攻击流量重放到其他队伍的靶机，自动获取 flag。<br>
-      <span style="color:#fbbf24">工作流程：</span>从攻击日志中选择一条请求 → 修改目标 IP 范围 → 广播发送 → 自动提取 flag → 提交到平台<br>
+      <span style="color:var(--accent)">工作流程：</span>从攻击日志中选择一条请求 → 修改目标 IP 范围 → 广播发送 → 自动提取 flag → 提交到平台<br>
       <span style="color:var(--text2);font-size:11px">注意：请确保自动提交 Flag 已配置并开启。</span>
     </div>
   </div> <div class="sec" style="border:1px solid var(--border)">
@@ -2888,7 +3396,7 @@ if (file_exists($fl)):
           <td><span class="b b-<?= $e(isset($ev['rule']) ? $ev['rule'] : '') ?>"><?= $e((isset($ev['rule']) ? $ev['rule'] : '')) ?></span></td>
           <td><?= $e($rmethod) ?></td>
           <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="<?= $e($ruri) ?>"><?= $e($ruri) ?></td>
-          <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fbbf24" title="<?= $e(isset($ev['payload']) ? $ev['payload'] : '') ?>"><?= $e(substr((isset($ev['payload']) ? $ev['payload'] : ''),0,40)) ?></td>
+          <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--accent)" title="<?= $e(isset($ev['payload']) ? $ev['payload'] : '') ?>"><?= $e(substr((isset($ev['payload']) ? $ev['payload'] : ''),0,40)) ?></td>
           <td><button type="button" class="btn bs" style="padding:2px 6px;font-size:10px" onclick="pwafLoadReplay(this)" data-raw="<?= $e(base64_encode($replay_raw)) ?>">加载</button></td>
         </tr>
         <?php endforeach; ?>
@@ -2902,7 +3410,7 @@ if (file_exists($fl)):
     <div style="color:var(--text2);font-size:12px;margin-bottom:14px;line-height:1.8">
       此处实时监控到达本服务器的<b>所有 HTTP 请求</b>（包含被拦截的攻击与放行的正常流量）。点击<code style="color:var(--accent);">详情</code>可查看完整请求报文。<br>
       
-      <details style="background:#060a14;border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin-top:8px;outline:none;" <?= !empty($cfg['autoreap_enabled']) ? 'open' : '' ?>>
+      <details style="background:var(--inset);border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin-top:8px;outline:none;" <?= !empty($cfg['autoreap_enabled']) ? 'open' : '' ?>>
         <summary style="cursor:pointer;color:#f97316;font-weight:bold;outline:none;user-select:none;">&#x25B6; 展开高级功能：全流量自动盲打收割配置</summary>
         <form method="post" action="<?= $e($self) ?>">
           <input type="hidden" name="waf_key" value="<?= $e($key) ?>">
@@ -2929,7 +3437,7 @@ if (file_exists($fl)):
                 </label>
                 <span id="auto-reap-status" style="font-weight:bold;color:var(--text2)">自动盲打: <?= !empty($cfg['autoreap_enabled']) ? '<span style="color:var(--red)">运行中...</span>' : '已关闭' ?></span>
               </div>
-              <div style="color:var(--text2);font-size:10px;line-height:1.8;background:#0a0e1a;padding:8px;border-radius:4px;border:1px solid var(--border)">
+              <div style="color:var(--text2);font-size:10px;line-height:1.8;background:var(--inset);padding:8px;border-radius:4px;border:1px solid var(--border)">
                 待处理队列: <span id="auto-queue-count" style="color:var(--cyan);font-weight:bold;">0</span><br>
                 已广播请求: <span id="auto-sent-count" style="color:var(--accent);font-weight:bold;">0</span><br>
                 捕获并提交 Flag: <span id="auto-flag-count" style="color:var(--green);font-weight:bold;">0</span>
@@ -2940,10 +3448,10 @@ if (file_exists($fl)):
       </details>
     </div>
 
-    <div style="border:1px solid var(--border);border-radius:6px;background:#0a0e1a;">
-      <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;gap:16px;align-items:center;background:#0f1629;border-radius:6px 6px 0 0;flex-wrap:wrap;">
+    <div style="border:1px solid var(--border);border-radius:6px;background:#fff;">
+      <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;gap:16px;align-items:center;background:var(--inset);border-radius:6px 6px 0 0;flex-wrap:wrap;">
         <span style="color:var(--text2);font-size:11px;font-weight:bold;">视图过滤:</span>
-        <select id="ft-filter-type" onchange="ftPage=1; renderFullTraffic()" style="background:#060a14;border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:11px;outline:none;">
+        <select id="ft-filter-type" onchange="ftPage=1; renderFullTraffic()" style="background:var(--inset);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:11px;outline:none;">
           <option value="all">全部流量</option>
           <option value="pass">仅看放行</option>
           <option value="block">仅看拦截</option>
@@ -3153,10 +3661,10 @@ function playAlertSound(isUrgent) {
 
 function showToast(title, msg, isUrgent) {
   var t = document.createElement('div');
-  var bgColor = isUrgent ? '#7f1d1d' : '#0f1629';
-  var bdColor = isUrgent ? '#dc2626' : '#1e2d4a';
-  var titleColor = isUrgent ? '#fca5a5' : '#f97316';
-  t.style.cssText = 'position:fixed;bottom:24px;right:24px;background:' + bgColor + ';border:1px solid ' + bdColor + ';color:#c9d1e0;padding:16px 20px;border-radius:8px;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,0.5);font-family:Consolas,monospace;animation:toastIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;min-width:280px;';
+  var bgColor = isUrgent ? '#fef2f2' : '#ffffff';
+  var bdColor = isUrgent ? '#dc2626' : '#e2e8f0';
+  var titleColor = isUrgent ? '#b91c1c' : '#ea580c';
+  t.style.cssText = 'position:fixed;bottom:24px;right:24px;background:' + bgColor + ';border:1px solid ' + bdColor + ';color:#1e293b;padding:16px 20px;border-radius:8px;z-index:9999;box-shadow:0 8px 24px rgba(15,23,42,0.12);font-family:Segoe UI,system-ui,sans-serif;animation:toastIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;min-width:280px;';
   t.innerHTML = '<div style="font-weight:bold;font-size:14px;margin-bottom:6px;color:' + titleColor + '">' + title + '</div><div style="font-size:12px;word-break:break-all;line-height:1.6;">' + msg + '</div>';
   document.body.appendChild(t);
   setTimeout(function() {
@@ -3209,7 +3717,7 @@ setInterval(function() {
               var ts = new Date((ev.ts || 0) * 1000);
               var timeStr = String(ts.getHours()).padStart(2,'0') + ':' + String(ts.getMinutes()).padStart(2,'0') + ':' + String(ts.getSeconds()).padStart(2,'0');
               var shortPayload = (ev.payload || '').length > 40 ? ev.payload.substring(0, 40) : ev.payload;
-              html += '<tr><td style="white-space:nowrap">' + timeStr + '</td><td><span class="b b-' + esc(ev.rule) + '">' + esc(ev.rule) + '</span></td><td>' + esc(rmethod) + '</td><td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(ruri) + '">' + esc(ruri) + '</td><td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fbbf24" title="' + esc(ev.payload) + '">' + esc(shortPayload) + '</td><td><button type="button" class="btn bs" style="padding:2px 6px;font-size:10px" onclick="pwafLoadReplay(this)" data-raw="' + b64raw + '">加载</button></td></tr>';
+              html += '<tr><td style="white-space:nowrap">' + timeStr + '</td><td><span class="b b-' + esc(ev.rule) + '">' + esc(ev.rule) + '</span></td><td>' + esc(rmethod) + '</td><td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(ruri) + '">' + esc(ruri) + '</td><td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--accent)" title="' + esc(ev.payload) + '">' + esc(shortPayload) + '</td><td><button type="button" class="btn bs" style="padding:2px 6px;font-size:10px" onclick="pwafLoadReplay(this)" data-raw="' + b64raw + '">加载</button></td></tr>';
             });
             html += '</tbody>'; replayTable.innerHTML = html;
           }
@@ -3360,8 +3868,8 @@ function renderFullTraffic() {
     var timeStr = String(ts.getHours()).padStart(2,'0') + ':' + String(ts.getMinutes()).padStart(2,'0') + ':' + String(ts.getSeconds()).padStart(2,'0');
     var isBlock = ev.action === 'block';
     var statusBadge = isBlock 
-        ? '<span class="b" style="background:#dc2626; color:#fff; border:1px solid #f87171; padding:2px 8px; box-shadow:0 0 8px rgba(220,38,38,0.4);">拦截</span>' 
-        : '<span class="b" style="background:#16a34a; color:#fff; border:1px solid #4ade80; padding:2px 8px; box-shadow:0 0 8px rgba(22,163,74,0.4);">放行</span>';
+        ? '<span class="b" style="background:#dc2626; color:#fff; padding:2px 8px;">拦截</span>' 
+        : '<span class="b" style="background:#16a34a; color:#fff; padding:2px 8px;">放行</span>';
     
     var rawReq = (ev.method || 'GET') + ' ' + (ev.uri || '/') + " HTTP/1.1\n";
     rawReq += "Host: {target}\n";   // 广播时按目标改写；不再直插未转义的 HTTP_HOST(会破坏 <script> 甚至注入)
@@ -3370,17 +3878,17 @@ function renderFullTraffic() {
     if (ev.method === 'POST') rawReq += "Content-Type: application/x-www-form-urlencoded\n";
     if (ev.post) rawReq += "\n" + ev.post;
     
-    var detailHtml = '<div style="background:#030712;padding:12px;border-radius:6px;border:1px solid var(--border);font-family:Consolas,monospace;font-size:12px;white-space:pre-wrap;color:#e2e8f0;max-height:350px;overflow-y:auto;box-shadow:inset 0 0 10px rgba(0,0,0,0.5);">' + esc(rawReq) + '</div>';
+    var detailHtml = '<div style="background:var(--inset);padding:12px;border-radius:6px;border:1px solid var(--border);font-family:Consolas,monospace;font-size:12px;white-space:pre-wrap;color:var(--text);max-height:350px;overflow-y:auto;">' + esc(rawReq) + '</div>';
     if (isBlock) {
-      detailHtml += '<div style="margin-top:8px;padding:8px;background:rgba(220,38,38,0.1);border-left:3px solid #dc2626;color:#fca5a5;font-size:11px;"><b>[拦截触发]</b> 规则: <span class="b br">' + esc(ev.rule) + '</span> &nbsp;|&nbsp; <b>[恶意载荷]</b> ' + esc(ev.payload) + '</div>';
+      detailHtml += '<div style="margin-top:8px;padding:8px;background:#fef2f2;border-left:3px solid #dc2626;color:#991b1b;font-size:11px;"><b>[拦截触发]</b> 规则: <span class="b br">' + esc(ev.rule) + '</span> &nbsp;|&nbsp; <b>[恶意载荷]</b> ' + esc(ev.payload) + '</div>';
     }
 
     html += '<tr>' +
       '<td style="white-space:nowrap;color:var(--text2);">' + timeStr + '</td>' +
       '<td>' + statusBadge + '</td>' +
       '<td>' + esc(ev.ip) + '</td>' +
-      '<td style="color:' + (ev.method==='POST'?'#f97316':'#38bdf8') + '; font-weight:bold;">' + esc(ev.method) + '</td>' +
-      '<td style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap; color:' + (isBlock ? '#fca5a5' : 'inherit') + '" title="' + esc(ev.uri) + '">' + esc(ev.uri) + '</td>' +
+      '<td style="color:' + (ev.method==='POST'?'#ea580c':'#0369a1') + '; font-weight:bold;">' + esc(ev.method) + '</td>' +
+      '<td style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap; color:' + (isBlock ? '#b91c1c' : 'inherit') + '" title="' + esc(ev.uri) + '">' + esc(ev.uri) + '</td>' +
       '<td style="text-align:center;"><button type="button" class="btn ' + (isBlock ? 'br' : 'bs') + '" style="padding:2px 8px; font-size:10px;" onclick="toggleTrafficDetail(\'' + ev._id + '\')">详情</button></td>' +
     '</tr>';
     
@@ -3554,24 +4062,22 @@ function pwaf_login_page(callable $e, $key, $err) { ?>
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PhoenixWAF</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0a0e1a;color:#c9d1e0;font-family:'Courier New',Consolas,monospace;display:flex;align-items:center;justify-content:center;min-height:100vh;overflow:hidden}
-body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 50% 0%,rgba(249,115,22,.08) 0%,transparent 60%);pointer-events:none}
-.box{background:#0f1629;border:1px solid #1e2d4a;border-radius:12px;padding:40px 36px;width:360px;position:relative;animation:fadein .4s ease}
+body{background:#f4f6fb;color:#1e293b;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;overflow:hidden}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 50% 0%,rgba(234,88,12,.08) 0%,transparent 55%);pointer-events:none}
+.box{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:40px 36px;width:360px;position:relative;animation:fadein .4s ease;box-shadow:0 12px 40px rgba(15,23,42,.08)}
 @keyframes fadein{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
-.box::before{content:'';position:absolute;inset:-1px;border-radius:13px;background:linear-gradient(135deg,rgba(249,115,22,.3),transparent 50%,rgba(56,189,248,.15));z-index:-1;animation:border-glow 3s ease-in-out infinite alternate}
-@keyframes border-glow{from{opacity:.5}to{opacity:1}}
 .logo{text-align:center;margin-bottom:28px}
-.logo-icon{font-size:36px;display:block;margin-bottom:8px;filter:drop-shadow(0 0 12px rgba(249,115,22,.6))}
-.logo-name{color:#f97316;font-size:22px;font-weight:bold;letter-spacing:4px;text-shadow:0 0 24px rgba(249,115,22,.5)}
-.logo-sub{color:#4a5568;font-size:11px;margin-top:4px;letter-spacing:1px}
+.logo-icon{font-size:36px;display:block;margin-bottom:8px}
+.logo-name{color:#ea580c;font-size:22px;font-weight:bold;letter-spacing:4px}
+.logo-sub{color:#64748b;font-size:11px;margin-top:4px;letter-spacing:1px}
 .field{margin-bottom:16px}
-input[type=password]{width:100%;background:#060a14;border:1px solid #1e2d4a;color:#c9d1e0;padding:11px 14px;border-radius:6px;font-family:inherit;font-size:13px;outline:none;transition:border-color .2s,box-shadow .2s}
-input[type=password]:focus{border-color:#f97316;box-shadow:0 0 0 3px rgba(249,115,22,.12)}
-button[type=submit]{width:100%;background:linear-gradient(135deg,#f97316,#ea580c);color:#000;border:none;padding:11px;border-radius:6px;font-weight:bold;font-size:13px;cursor:pointer;font-family:inherit;letter-spacing:1px;transition:filter .2s,transform .1s;margin-top:4px}
-button[type=submit]:hover{filter:brightness(1.1);transform:translateY(-1px)}
+input[type=password]{width:100%;background:#f8fafc;border:1px solid #e2e8f0;color:#1e293b;padding:11px 14px;border-radius:6px;font-family:inherit;font-size:13px;outline:none;transition:border-color .2s,box-shadow .2s}
+input[type=password]:focus{border-color:#ea580c;box-shadow:0 0 0 3px rgba(234,88,12,.12);background:#fff}
+button[type=submit]{width:100%;background:linear-gradient(135deg,#f97316,#ea580c);color:#fff;border:none;padding:11px;border-radius:6px;font-weight:bold;font-size:13px;cursor:pointer;font-family:inherit;letter-spacing:1px;transition:filter .2s,transform .1s;margin-top:4px}
+button[type=submit]:hover{filter:brightness(1.05);transform:translateY(-1px)}
 button[type=submit]:active{transform:translateY(0)}
-.err{color:#f87171;font-size:11px;margin-bottom:12px;padding:8px 10px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.2);border-radius:5px}
-.hint{text-align:center;color:#6b7a92;font-size:10px;margin-top:18px;letter-spacing:.5px}
+.err{color:#b91c1c;font-size:11px;margin-bottom:12px;padding:8px 10px;background:#fef2f2;border:1px solid #fecaca;border-radius:5px}
+.hint{text-align:center;color:#94a3b8;font-size:10px;margin-top:18px;letter-spacing:.5px}
 </style></head><body>
 <div class="box">
   <div class="logo"><span class="logo-icon">&#x1F9E8;</span><div class="logo-name">PHOENIX</div><div class="logo-sub">WAF v<?= PWAF_VER ?> &mdash; 管理面板</div></div>
@@ -3673,7 +4179,7 @@ function pwaf_update_baseline(array $cfg) {
     $wr = (isset($cfg['webroot']) ? $cfg['webroot'] : '');
     if (!$wr || !is_dir($wr)) return;
     $h = [];
-    foreach (pwaf_all_files($wr) as $f) $h[$f] = hash_file('sha256', $f);
+    foreach (pwaf_all_files($wr, $cfg) as $f) $h[$f] = hash_file('sha256', $f);
     file_put_contents($db, json_encode(['b'=>$h,'ts'=>time()]), LOCK_EX);
 }
 
@@ -3737,7 +4243,9 @@ function pwaf_install(array $argv) {
     $cfg['integrity_db'] = $datadir . '/.tmp_integrity';
     $cfg['backup']       = $datadir . '/.common.bak.php';
     $cfg['webroot']      = $wr;
-    $cfg['enabled']      = true;
+    $cfg['enabled']         = true;
+    $cfg['checker_detect']  = true;
+    $cfg['checker_ttl']     = 1800;
 
     file_put_contents($datadir . '/.pwaf.php', '<?php return ' . var_export($cfg, true) . ';', LOCK_EX);
     copy($final_waf_path, $cfg['backup']);
@@ -3791,7 +4299,7 @@ function pwaf_install(array $argv) {
     }
 
         $hashes = [];
-    foreach (pwaf_all_files($wr) as $f) $hashes[$f] = hash_file('sha256', $f);
+    foreach (pwaf_all_files($wr, $cfg) as $f) $hashes[$f] = hash_file('sha256', $f);
     file_put_contents($cfg['integrity_db'], json_encode(['b'=>$hashes,'ts'=>time()]), LOCK_EX);
 
         pwaf_deploy_watcher($wr, true);
@@ -3826,19 +4334,39 @@ function pwaf_install(array $argv) {
 
 // Deploys a bash script that uses inotifywait (inotify-tools) for event-driven
 // file monitoring — zero CPU idle cost, instant response to filesystem changes
+function pwaf_hidden_dir($wr) {
+    $wr = rtrim(str_replace('\\', '/', $wr), '/');
+    $list = @scandir($wr);
+    if (!is_array($list)) return '';
+    foreach ($list as $item) {
+        if ($item === '.' || $item === '..' || $item[0] !== '.') continue;
+        $d = $wr . '/' . $item;
+        if (is_dir($d) && (file_exists($d . '/common.inc.php') || file_exists($d . '/.pwaf.php'))) return $d;
+    }
+    return '';
+}
+
 function pwaf_deploy_watcher($wr, $silent = false) {
-    $wr = rtrim(realpath($wr) ?: $wr, '/\\');
+    $wr = rtrim(str_replace('\\', '/', realpath($wr) ?: $wr), '/');
     if (!is_dir($wr)) { if (!$silent) echo "[!] Not a directory: $wr\n"; return; }
     if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') { if (!$silent) echo "[i] L6: inotifywait not available on Windows\n"; return; }
 
-    $watcher_path = $wr . '/.pwaf_watcher.sh';
-    $log_path     = $wr . '/.pwaf_log';
-    $bak_path     = $wr . '/.pwaf_bak.php';
-    $waf_path     = $wr . '/waf.php';
-    $cfg_path     = $wr . '/.pwaf.php';
+    $datadir = pwaf_hidden_dir($wr);
+    if ($datadir === '') $datadir = $wr;
+    $hidden_bn    = basename($datadir);
+    $watcher_path = $datadir . '/.pwaf_watcher.sh';
+    $log_path     = $datadir . '/.pwaf_log';
+    if (file_exists($datadir . '/.pwaf.php')) {
+        $cfgw = @include $datadir . '/.pwaf.php';
+        if (is_array($cfgw) && !empty($cfgw['log'])) $log_path = $cfgw['log'];
+    }
+    $bak_path     = file_exists($datadir . '/.common.bak.php') ? ($datadir . '/.common.bak.php') : ($datadir . '/.pwaf_bak.php');
+    $waf_path     = file_exists($datadir . '/common.inc.php') ? ($datadir . '/common.inc.php') : ($wr . '/waf.php');
+    $cfg_path     = $datadir . '/.pwaf.php';
     $htaccess     = $wr . '/.htaccess';
     $userini      = $wr . '/.user.ini';
-    $pid_path     = $wr . '/.pwaf_watcher.pid';
+    $pid_path     = $datadir . '/.pwaf_watcher.pid';
+    $old_pid_web  = $wr . '/.pwaf_watcher.pid';
 
         $shell_pats = 'eval\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)'
                 . '|assert\s*\(\s*\$_(GET|POST|REQUEST)'
@@ -3859,6 +4387,7 @@ function pwaf_deploy_watcher($wr, $silent = false) {
 # Deployed by: pwaf_deploy_watcher()
 
 WEBROOT="{$wr}"
+HIDDEN_BN="{$hidden_bn}"
 LOG="{$log_path}"
 PID_FILE="{$pid_path}"
 WAF_PHP="{$waf_path}"
@@ -3867,8 +4396,8 @@ WAF_BAK="{$bak_path}"
 HTACCESS="{$htaccess}"
 USERINI="{$userini}"
 
-# Core files to protect (auto-restore if deleted/modified)
-PROTECTED_FILES=("waf.php" ".pwaf.php" ".htaccess" ".user.ini" ".pwaf_bak.php")
+# Core files to protect (隐身部署下核心是 common.inc.php 不是 waf.php)
+PROTECTED_FILES=("common.inc.php" ".common.bak.php" ".pwaf.php" ".htaccess" ".user.ini" "waf.so" "waf.php")
 
 # Webshell detection regex (PCRE, for grep -P)
 SHELL_REGEX='{$shell_pats}'
@@ -3890,15 +4419,14 @@ log_event() {
 restore_protected() {
     local bn="\$1"
     case "\$bn" in
-        "waf.php")
+        "common.inc.php"|"waf.php")
             if [ -f "\$WAF_BAK" ]; then
                 cp -f "\$WAF_BAK" "\$WAF_PHP" 2>/dev/null
                 log_event "watcher_restore" "\$WAF_PHP" "restored from backup" "restored"
             fi
             ;;
-        ".pwaf.php"|".htaccess"|".user.ini"|".pwaf_bak.php")
-            # These are config-sensitive, log the deletion but only restore waf.php
-            log_event "watcher_deleted" "\$WEBROOT/\$bn" "protected file deleted" "alert"
+        ".pwaf.php"|".htaccess"|".user.ini"|".common.bak.php"|".pwaf_bak.php"|"waf.so")
+            log_event "watcher_deleted" "\$bn" "protected file deleted" "alert"
             ;;
     esac
 }
@@ -3908,9 +4436,11 @@ check_webshell() {
     local filepath="\$1"
     local bn=\$(basename "\$filepath")
 
-    # Skip WAF's own files
     case "\$bn" in
-        waf.php|.pwaf*|.pwaf_watcher*) return 1 ;;
+        waf.php|common.inc.php|.pwaf*|.pwaf_watcher*|waf.so) return 1 ;;
+    esac
+    case "\$filepath" in
+        *"/\${HIDDEN_BN}/"*) return 1 ;;
     esac
 
     # Only check PHP files
@@ -3953,12 +4483,14 @@ fi
 # --recursive: watch all subdirectories
 # --exclude: skip WAF log/rate/counter files (high-frequency writes)
 inotifywait -m -r -e create,modify,delete,moved_to \\
-    --exclude '\.pwaf_(log|rate|cnt|chk|access|watcher\.pid)' \\
+    --exclude "(\${HIDDEN_BN}|\\.pwaf_(log|rate|cnt|chk|access|tick|watcher))" \\
     --format '%w%f|%e' \\
     "\$WEBROOT" 2>/dev/null | while IFS='|' read -r FILEPATH EVENTS; do
 
-    # Skip empty
     [ -z "\$FILEPATH" ] && continue
+    case "\$FILEPATH" in
+        *"/\${HIDDEN_BN}/"*) continue ;;
+    esac
 
     local_bn=\$(basename "\$FILEPATH")
 
@@ -3969,12 +4501,12 @@ inotifywait -m -r -e create,modify,delete,moved_to \\
                 restore_protected "\$pf"
             elif echo "\$EVENTS" | grep -q "MODIFY"; then
                 # Protected file was modified — check if it's still valid
-                if [ "\$pf" = "waf.php" ] && [ -f "\$WAF_BAK" ]; then
+                if { [ "\$pf" = "common.inc.php" ] || [ "\$pf" = "waf.php" ]; } && [ -f "\$WAF_BAK" ]; then
                     local orig_hash=\$(sha256sum "\$WAF_BAK" 2>/dev/null | cut -d' ' -f1)
                     local curr_hash=\$(sha256sum "\$WAF_PHP" 2>/dev/null | cut -d' ' -f1)
                     if [ "\$orig_hash" != "\$curr_hash" ]; then
                         cp -f "\$WAF_BAK" "\$WAF_PHP" 2>/dev/null
-                        log_event "watcher_tamper" "\$WAF_PHP" "waf.php tampered, restored" "restored"
+                        log_event "watcher_tamper" "\$WAF_PHP" "core tampered, restored" "restored"
                     fi
                 fi
             fi
@@ -3997,10 +4529,10 @@ BASH;
     file_put_contents($watcher_path, $script, LOCK_EX);
     @chmod($watcher_path, 0755);
 
-        if (file_exists($pid_path)) {
-        $old_pid = trim(@file_get_contents($pid_path));
-        if ($old_pid && is_numeric($old_pid)) {
-            @exec("kill $old_pid 2>/dev/null");
+    foreach (array($pid_path, $old_pid_web) as $pp) {
+        if (file_exists($pp)) {
+            $old_pid = trim(@file_get_contents($pp));
+            if ($old_pid && is_numeric($old_pid)) @exec("kill $old_pid 2>/dev/null");
         }
     }
 
@@ -4300,7 +4832,7 @@ CSRC_HEAD;
 static const char *exec_blocked[] = {
     "flag", "LD_PRELOAD", "waf.so", "waf.php", ".pwaf",
     "/dev/tcp/", "/dev/udp/", "nc -e", "nc -lp", "ncat -e", "mkfifo", "socat",
-    "/etc/shadow", "/etc/passwd", "base64.*decode",
+    "/etc/shadow", "/etc/passwd", "base64 -d", "base64 -D", "base64 --decode", "base64_decode",
     "python -c", "python3 -c", "perl -e", "ruby -e", "php -r",
     "bash -i", "sh -i", "chattr", "setfacl", "crontab", "wget ", "curl ",
     NULL
@@ -4561,6 +5093,7 @@ CSRC_BODY;
     }
     pwaf_save_cfg($cfg);
     echo "[+] Config updated: LD_PRELOAD enabled\n";
+    pwaf_persist_ldpreload($so_path);
 
     echo "\n[*] Usage:\n";
     echo "    Method A (recommended): WAF auto-sets LD_PRELOAD at runtime\n";
@@ -4578,4 +5111,38 @@ CSRC_BODY;
     echo "    + link     - blocks hardlinking protected files\n";
     echo "    + fopen    - blocks opening protected files in write/truncate mode\n";
     echo "    + *at      - unlinkat/renameat/fchmodat (modern rm/mv/chmod path)\n";
+}
+
+function pwaf_persist_ldpreload($so_path) {
+    if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') return;
+    if (!$so_path || !file_exists($so_path)) return;
+    $so_path = str_replace('\\', '/', $so_path);
+    $line = 'env[LD_PRELOAD] = ' . $so_path;
+    $cands = glob('/etc/php/*/fpm/pool.d/www.conf') ?: array();
+    $cands[] = '/etc/php-fpm.d/www.conf';
+    $cands[] = '/usr/local/etc/php-fpm.d/www.conf';
+    $wrote = 0;
+    foreach ($cands as $cf) {
+        if (!$cf || !is_file($cf) || !is_writable($cf)) continue;
+        $txt = @file_get_contents($cf);
+        if ($txt === false) continue;
+        if (strpos($txt, $so_path) !== false) continue;
+        if (@file_put_contents($cf, rtrim($txt) . "\n; PhoenixWAF LD_PRELOAD\n" . $line . "\n") !== false) {
+            echo "[+] Persist LD_PRELOAD -> $cf (reload php-fpm to apply to workers)\n";
+            $wrote++;
+        }
+    }
+    $envf = '/etc/environment';
+    if (is_file($envf) && is_writable($envf)) {
+        $et = (string)@file_get_contents($envf);
+        if (strpos($et, $so_path) === false) {
+            @file_put_contents($envf, rtrim($et) . "\nLD_PRELOAD=" . $so_path . "\n");
+            echo "[+] Persist LD_PRELOAD -> /etc/environment\n";
+        }
+    }
+    if ($wrote) {
+        foreach (array('php-fpm','php7.0-fpm','php7.2-fpm','php7.4-fpm','php8.0-fpm','php8.1-fpm','php8.2-fpm') as $svc) {
+            @exec('systemctl reload ' . $svc . ' 2>/dev/null');
+        }
+    }
 }

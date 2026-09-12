@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## 最高约束（AWD 单文件，必须遵守）
+
+本项目为 **AWD 竞赛** 设计，靶机部署要极简、可拷即用。文件数量是硬限制，不是风格偏好：
+
+- **所有 PHP（含面板 HTML/CSS/JS、安装器、配置默认值）只能写进 / 改 `waf.php` 这一个文件。**
+- **所有 C 只能写进 / 改 `pwaf_ldpreload.c` 这一个文件。**
+- **禁止** 为功能拆出新的 `.php` / `.c` / `.h` / `.js` / `.css` / 库目录 / 多文件模块。不要“重构成分文件更清晰”。
+- 允许动的非产品文件仅限：`CLAUDE.md`、`README.md`、`LICENSE`、已有的 `test_web/` 测试靶场。不要再加第三份产品源码。
+
+违反这条 = 做错了。改检测、面板、安装、LD_PRELOAD 钩子，都在这两个文件里完成。
+
 ## What this is
 
 PhoenixWAF (aka iWAF) is a single-file PHP Web Application Firewall built for **AWD (Attack With Defense) CTF competitions**. Its job is to protect a target PHP site's flag while it runs *inside* that site, survive attacker attempts to remove it, and (optionally) automate counter-attacks (traffic replay, blind-spray "reap", auto flag submission). It is a purpose-built offensive/defensive CTF tool, not a general production WAF — comments and README are in Chinese.

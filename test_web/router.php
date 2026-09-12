@@ -2,7 +2,8 @@
 // Front controller for the php -S test server. Loads the WAF for EVERY request
 // (incl. non-existent scanner/honeypot paths), mirroring a production Apache deploy
 // where the WAF runs on every hit via auto_prepend + .htaccess ForceType.
-require __DIR__ . '/common.inc.php';   // ← WAF executes here (pwaf_run under cli-server SAPI)
+$waf = __DIR__ . '/common.inc.php';
+if (is_file($waf)) require $waf;   // test runner copies ../waf.php here; absent = shop only
 
 $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $target = ($path === '/' || $path === '') ? '/index.php' : $path;
